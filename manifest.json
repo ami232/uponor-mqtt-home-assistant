@@ -1,0 +1,17 @@
+{
+    "domain": "uponor-mqtt-home-assistant",
+    "name": "Uponor MQTT Bridge",
+    "version": "1.0.0",
+    "documentation": "https://github.com/ami232/uponor-mqtt-home-assistant",
+    "requirements": [
+        "paho-mqtt>=1.6"
+    ],
+    "dependencies": [
+        "mqtt"
+    ],
+    "config_flow": true,
+    "codeowners": [
+        "@ami232"
+    ],
+    "iot_class": "local_polling"
+}
