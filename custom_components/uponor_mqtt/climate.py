@@ -67,11 +67,17 @@ async def async_setup_platform(
         return coordinator
 
     # Create entities for devices already in cache
-    for device_id in list(bridge.device_state_cache.keys()):
+    device_ids = list(bridge.device_state_cache.keys())
+    _LOGGER.debug(
+        "Setting up climate platform, found %d devices in cache", len(device_ids)
+    )
+    for device_id in device_ids:
         coordinator = _create_coordinator(device_id)
         entities.append(UponorClimate(bridge, device_id, coordinator))
 
     async_add_entities(entities)
+    if entities:
+        _LOGGER.info("Added %d Uponor climate entities", len(entities))
 
     # listen for new devices and add entities dynamically
     @callback
@@ -79,6 +85,7 @@ async def async_setup_platform(
         coordinator = _create_coordinator(device_id)
         entity = UponorClimate(bridge, device_id, coordinator)
         async_add_entities([entity])
+        _LOGGER.info("New Uponor device discovered, created entity for %s", device_id)
 
     async_dispatcher_connect(hass, f"{DOMAIN}_device_new", _async_new_device)
 
@@ -89,7 +96,7 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
     def __init__(
         self, bridge: Any, device_id: str, coordinator: DataUpdateCoordinator
     ) -> None:
-        CoordinatorEntity.__init__(self, coordinator)
+        super().__init__(coordinator)
         self.bridge = bridge
         self.device_id = device_id
         self._name = f"Uponor {device_id}"
@@ -144,13 +151,20 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
 
     async def async_added_to_hass(self) -> None:
         # register dispatcher to forward updates into the coordinator
-        async_dispatcher_connect(
+        self._unsub_dispatcher = async_dispatcher_connect(
             self.bridge.hass,
             f"{DOMAIN}_update_{self.device_id}",
             lambda state: self.hass.async_create_task(
                 self.coordinator.async_set_updated_data(state)
             ),
         )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if hasattr(self, "_unsub_dispatcher") and self._unsub_dispatcher:
+            try:
+                self._unsub_dispatcher()
+            except Exception:
+                _LOGGER.debug("Failed to unsubscribe dispatcher for %s", self.device_id)
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Handle set temperature from Home Assistant UI."""
@@ -159,5 +173,6 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
         temp = float(kwargs["temperature"])
         await self.bridge.async_set_temperature(self.device_id, temp)
         # optimistic update in coordinator
-        self.coordinator.data = {**(self.coordinator.data or {}), "temperature": temp}
-        self.async_write_ha_state()
+        await self.coordinator.async_set_updated_data(
+            {**(self.coordinator.data or {}), "temperature": temp}
+        )

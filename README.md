@@ -10,9 +10,11 @@ Features
 - Time synchronization to the bus when a time-master thermostat is detected.
 
 Topics used
-- uponor_read (binary): input topic with raw Uponor packet bytes (bridge subscribes)
-- uponor_write (binary): output topic where the integration publishes command packets
-- homeassistant/climate/uponor_<ID>/... : MQTT discovery and state topics (discovery prefix configurable)
+- `uponor_read` (binary): input topic with raw Uponor packet bytes. The integration
+  subscribes without forcing UTF-8 decoding so binary payloads are delivered as
+  raw bytes to the bridge callback.
+- `uponor_write` (binary): output topic where the integration publishes command packets.
+- `homeassistant/climate/uponor_<ID>/...`: MQTT discovery and state topics (discovery prefix configurable).
 
 Installation
 1. Copy the `uponor_mqtt` folder into your Home Assistant `custom_components` directory so you have:
@@ -49,6 +51,17 @@ Developer notes
 - Protocol helpers are bundled in `custom_components/uponor_mqtt/uponor_protocol.py`.
 - Core bridge logic is in `custom_components/uponor_mqtt/bridge.py`.
 - The climate entity implementation is in `custom_components/uponor_mqtt/climate.py` and uses `DataUpdateCoordinator`.
+
+Project layout
+- `custom_components/uponor_mqtt/` — integration code (bridge, protocol helpers, entities).
+- `uponor_devices.json` — optional device metadata (if present).
+- `uponor-mqtt/` — standalone Python helper and Docker compose for running a translator outside HA (kept for reference).
+
+Notes
+- This repository contains the Home Assistant custom integration; installation copies
+  `custom_components/uponor_mqtt` into your HA `config/custom_components` directory.
+- If you want, I can prepare a HACS package metadata update or add example scripts
+  for generating test packets.
 
 Troubleshooting
 - If entities do not appear: verify that `uponor_read` messages are arriving on the broker and contain valid packets. The bridge uses CRC checking and will ignore invalid packets.

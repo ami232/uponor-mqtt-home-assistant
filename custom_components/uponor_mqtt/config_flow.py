@@ -8,7 +8,7 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 
-from .const import DOMAIN
+from .const import DOMAIN, HA_DISCOVERY_PREFIX
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,11 +26,11 @@ class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Optional("name", default="Uponor MQTT Bridge"): str,
                     vol.Optional("use_core_mqtt", default=True): bool,
-                    vol.Optional("host", default="192.168.1.31"): str,
+                    vol.Optional("host", default=""): str,
                     vol.Optional("port", default=1883): int,
                     vol.Optional("username", default=""): str,
                     vol.Optional("password", default=""): str,
-                    vol.Optional("discovery_prefix", default="homeassistant"): str,
+                    vol.Optional("discovery_prefix", default=HA_DISCOVERY_PREFIX): str,
                 }
             )
             return self.async_show_form(step_id="user", data_schema=schema)
@@ -39,8 +39,16 @@ class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data: dict[str, Any] = {
             "name": user_input.get("name", "Uponor MQTT Bridge"),
             "use_core_mqtt": bool(user_input.get("use_core_mqtt", True)),
-            "discovery_prefix": user_input.get("discovery_prefix", "homeassistant"),
+            "discovery_prefix": user_input.get("discovery_prefix", HA_DISCOVERY_PREFIX),
         }
+
+        # Log what the user selected (avoid logging secrets)
+        _LOGGER.info(
+            "Config flow submission: name=%s use_core_mqtt=%s discovery_prefix=%s",
+            data["name"],
+            data["use_core_mqtt"],
+            data["discovery_prefix"],
+        )
 
         if not data["use_core_mqtt"]:
             # save manual broker settings
@@ -48,35 +56,8 @@ class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 "host": user_input.get("host", "192.168.1.31"),
                 "port": int(user_input.get("port", 1883)),
                 "username": user_input.get("username") or None,
+                # Do not log password
                 "password": user_input.get("password") or None,
             }
 
         return self.async_create_entry(title=data["name"], data=data)
-
-
-"""Config flow for Uponor MQTT Bridge integration."""
-
-from __future__ import annotations
-
-import logging
-
-from homeassistant import config_entries
-from homeassistant.core import callback
-
-from .const import DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
-
-
-class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
-
-    async def async_step_user(self, user_input=None):
-        """Handle the initial step."""
-        if user_input is None:
-            return self.async_show_form(step_id="user")
-
-        # No config required - the integration uses the existing MQTT broker.
-        title = user_input.get("name") or "Uponor MQTT Bridge"
-        return self.async_create_entry(title=title, data={})

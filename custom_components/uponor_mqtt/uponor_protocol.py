@@ -1,9 +1,6 @@
-"""
-Copied subset of repository `uponor_protocol.py` so the integration is self-contained.
+"""Protocol helpers for parsing and building Uponor bus packets.
 
-This file is a verbatim copy (with no external dependencies) of the protocol
-helpers used by the bridge. Keeping this inside the integration avoids import
-errors when the repository layout differs from Home Assistant's `custom_components`.
+This module provides minimal helpers used by the bridge implementation.
 """
 
 import struct

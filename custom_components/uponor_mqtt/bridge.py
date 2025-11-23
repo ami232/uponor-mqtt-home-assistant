@@ -1,8 +1,6 @@
-"""Bridge that adapts the existing Uponor protocol utilities to Home Assistant's MQTT API.
+"""Uponor MQTT bridge for Home Assistant.
 
-This file keeps most of the parsing/packet building logic by importing
-`uponor_protocol` from the repository and uses Home Assistant's
-`mqtt.async_subscribe` / `mqtt.async_publish` for MQTT operations.
+Lightweight bridge that adapts Uponor protocol helpers to HA's MQTT API.
 """
 
 from __future__ import annotations
@@ -14,12 +12,14 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.components import mqtt
+from homeassistant.exceptions import HomeAssistantError, ConfigEntryNotReady
+from homeassistant.components import persistent_notification
 import types
 import asyncio as _asyncio
 
 try:
     import paho.mqtt.client as paho
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     paho = None
 
 from .uponor_protocol import (
@@ -61,13 +61,12 @@ class HAUponorBridge:
         self._manual_mqtt = manual_mqtt is not None
         self._manual_config = manual_mqtt or {}
         self._paho_client = None
-        if discovery_prefix:
-            # allow overriding discovery prefix from config entry
-            global HA_DISCOVERY_PREFIX
-            HA_DISCOVERY_PREFIX = discovery_prefix
+        # per-instance discovery prefix (do not mutate imported module constant)
+        self._discovery_prefix = discovery_prefix or HA_DISCOVERY_PREFIX
 
     async def async_start(self) -> None:
         """Start subscriptions and background tasks."""
+        _LOGGER.debug("Starting Uponor bridge (manual=%s)", self._manual_mqtt)
         if self._manual_mqtt and paho is not None:
             # Create and start a paho client in background thread
             client_id = "uponor_translator"
@@ -78,19 +77,19 @@ class HAUponorBridge:
                     self._manual_config.get("password"),
                 )
 
-            # wire callbacks
+            # Wire callbacks for paho client
             def _on_connect(client, userdata, flags, rc):
                 _LOGGER.info("Manual MQTT client connected (rc=%s)", rc)
                 # subscribe to topics on connect
                 client.subscribe(
                     [
                         ("uponor_read", 0),
-                        (f"{HA_DISCOVERY_PREFIX}/climate/+/temperature/set", 0),
+                        (f"{self._discovery_prefix}/climate/+/temperature/set", 0),
                     ]
                 )
 
             def _on_message(client, userdata, msg):
-                # schedule coroutine handling in HA loop
+                # Schedule coroutine handling in HA loop
                 ns = types.SimpleNamespace(payload=msg.payload, topic=msg.topic)
                 loop = self.hass.loop
                 loop.call_soon_threadsafe(
@@ -105,15 +104,45 @@ class HAUponorBridge:
             try:
                 self._paho_client.connect_async(host, port)
                 self._paho_client.loop_start()
+                _LOGGER.info(
+                    "Manual paho MQTT client started and connecting to %s:%s",
+                    host,
+                    port,
+                )
             except Exception as exc:
                 _LOGGER.exception("Failed to connect manual MQTT client: %s", exc)
         else:
             # Subscribe to incoming Uponor packets using HA MQTT helper
-            await mqtt.async_subscribe(
-                self.hass, "uponor_read", self._on_message_reader
-            )
-            temp_cmd = f"{HA_DISCOVERY_PREFIX}/climate/+/temperature/set"
-            await mqtt.async_subscribe(self.hass, temp_cmd, self._on_message_writer)
+            try:
+                # Do not force MQTT payload decoding so callbacks receive raw bytes
+                await mqtt.async_subscribe(
+                    self.hass, "uponor_read", self._on_message_reader, encoding=None
+                )
+                temp_cmd = f"{self._discovery_prefix}/climate/+/temperature/set"
+                await mqtt.async_subscribe(self.hass, temp_cmd, self._on_message_writer)
+                _LOGGER.info(
+                    "Subscribed to MQTT topics: 'uponor_read' and '%s'", temp_cmd
+                )
+            except HomeAssistantError as exc:
+                _LOGGER.warning(
+                    "Failed to subscribe to MQTT topics (MQTT not ready): %s", exc
+                )
+                try:
+                    persistent_notification.async_create(
+                        self.hass,
+                        (
+                            "Uponor MQTT Bridge could not subscribe to MQTT topics. "
+                            "Ensure the MQTT integration is configured and connected, or "
+                            "enable Manual MQTT mode in the Uponor integration options."
+                        ),
+                        "Uponor MQTT Bridge: MQTT subscription failed",
+                    )
+                except Exception:
+                    _LOGGER.debug(
+                        "Failed to create persistent notification for MQTT subscribe failure"
+                    )
+                # Defer setup so Home Assistant will retry later
+                raise ConfigEntryNotReady("MQTT integration not ready") from exc
 
         # Start time sync background task
         loop = asyncio.get_running_loop()
@@ -122,11 +151,16 @@ class HAUponorBridge:
 
     async def _dispatch_msg_from_thread(self, ns: types.SimpleNamespace) -> None:
         """Helper scheduled from paho thread to dispatch incoming messages."""
+        _LOGGER.debug(
+            "Dispatching manual MQTT message from thread: topic=%s payload_len=%s",
+            ns.topic,
+            len(ns.payload) if ns.payload is not None else 0,
+        )
         # determine handler by topic
         if ns.topic == "uponor_read":
             await self._on_message_reader(ns)
         elif ns.topic.endswith("/temperature/set") and ns.topic.startswith(
-            f"{HA_DISCOVERY_PREFIX}/climate/"
+            f"{self._discovery_prefix}/climate/"
         ):
             await self._on_message_writer(ns)
         else:
@@ -162,7 +196,15 @@ class HAUponorBridge:
     async def _on_message_reader(self, msg) -> None:  # callback from mqtt
         """Handle incoming `uponor_read` MQTT messages."""
         payload: bytes = msg.payload
-        _LOGGER.debug("Received uponor_read %d bytes", len(payload))
+        try:
+            plen = len(payload)
+        except Exception:
+            plen = 0
+        _LOGGER.debug(
+            "Received uponor_read message (len=%s) topic=%s",
+            plen,
+            getattr(msg, "topic", "uponor_read"),
+        )
 
         packets = split_packets(payload)
         if not packets:
@@ -172,6 +214,7 @@ class HAUponorBridge:
         for raw_pkt in packets:
             packet = parse_uponor_packet(raw_pkt)
             if not packet:
+                _LOGGER.debug("Failed to parse uponor packet: %s", raw_pkt.hex())
                 continue
 
             sys_id = packet["sys_id"]
@@ -211,22 +254,33 @@ class HAUponorBridge:
                     ha_state["temperature"] = round(ha_state["temperature"] + offset, 1)
 
             unique_id = f"uponor_{device_id_str}"
-            base_topic = f"{HA_DISCOVERY_PREFIX}/climate/{unique_id}"
+            base_topic = f"{self._discovery_prefix}/climate/{unique_id}"
 
             # Publish availability and state fields
             await self._publish(f"{base_topic}/availability", "online")
             for k, v in ha_state.items():
-                await self._publish(f"{base_topic}/{k}", v)
+                try:
+                    await self._publish(f"{base_topic}/{k}", v)
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed publishing state field %s for %s", k, device_id_str
+                    )
 
             # store sys_id for writes
             await self._publish(f"{base_topic}/sys_id", sys_id)
 
             # Publish discovery config if not already
             if device_id_str not in self.discovered_devices:
-                await self._publish(
-                    f"{HA_DISCOVERY_PREFIX}/climate/{unique_id}/config",
-                    self._build_discovery_config(device_id, sys_id),
-                )
+                try:
+                    cfg = self._build_discovery_config(device_id, sys_id)
+                    await self._publish(
+                        f"{self._discovery_prefix}/climate/{unique_id}/config", cfg
+                    )
+                    _LOGGER.info("Published discovery config for %s", device_id_str)
+                except Exception:
+                    _LOGGER.exception(
+                        "Failed to publish discovery config for %s", device_id_str
+                    )
                 self.discovered_devices.add(device_id_str)
                 # notify listeners that a new device appeared
                 try:
@@ -246,7 +300,9 @@ class HAUponorBridge:
                     self.hass, f"{DOMAIN}_update_{device_id_str}", ha_state
                 )
             except Exception:
-                _LOGGER.debug("Failed to send dispatcher update for %s", device_id_str)
+                _LOGGER.exception(
+                    "Failed to send dispatcher update for %s", device_id_str
+                )
 
             # Detect time master
             if (
@@ -277,10 +333,21 @@ class HAUponorBridge:
             return
 
         try:
-            payload = msg.payload.decode()
+            # payload may be bytes or string
+            raw_payload = msg.payload
+            if isinstance(raw_payload, bytes):
+                payload = raw_payload.decode()
+            else:
+                payload = str(raw_payload)
             temp_from_ha = float(payload)
+            _LOGGER.debug("Received temperature set for %s -> %s", dev_id, temp_from_ha)
         except Exception as exc:
-            _LOGGER.error("Invalid payload on %s: %s", msg.topic, exc)
+            _LOGGER.error(
+                "Invalid payload on %s: %s (raw=%s)",
+                msg.topic,
+                exc,
+                getattr(msg, "payload", None),
+            )
             return
 
         device_state = self.device_state_cache.get(dev_id.upper())
@@ -309,8 +376,8 @@ class HAUponorBridge:
                 sys_id,
             )
             # Echo back
-            base_topic = f"{HA_DISCOVERY_PREFIX}/climate/uponor_{dev_id}"
-            await self._publish(f"{base_topic}/temperature", payload)
+            base_topic = f"{self._discovery_prefix}/climate/uponor_{dev_id}"
+            await self._publish(f"{base_topic}/temperature", str(temp_from_ha))
         except Exception as exc:
             _LOGGER.exception("Failed to build/send command for %s: %s", dev_id, exc)
 
@@ -321,6 +388,9 @@ class HAUponorBridge:
             device_id: 4-hex uppercase device id string (e.g. '00A1')
             temperature: temperature in Celsius as float
         """
+        _LOGGER.debug(
+            "API set temperature request for %s -> %s", device_id, temperature
+        )
         device_state = self.device_state_cache.get(device_id.upper())
         if device_state:
             sys_id = device_state["sys_id"]
@@ -345,7 +415,7 @@ class HAUponorBridge:
                 temp_to_send,
                 sys_id,
             )
-            base_topic = f"{HA_DISCOVERY_PREFIX}/climate/uponor_{device_id}"
+            base_topic = f"{self._discovery_prefix}/climate/uponor_{device_id}"
             await self._publish(f"{base_topic}/temperature", str(temperature))
         except Exception as exc:
             _LOGGER.exception("Failed to build/send command for %s: %s", device_id, exc)
@@ -353,7 +423,7 @@ class HAUponorBridge:
     def _build_discovery_config(self, device_id: int, sys_id: int) -> str:
         device_id_str = f"{device_id:04X}"
         unique_id = f"uponor_{device_id_str}"
-        base_topic = f"{HA_DISCOVERY_PREFIX}/climate/{unique_id}"
+        base_topic = f"{self._discovery_prefix}/climate/{unique_id}"
         config = {
             "name": f"Uponor {device_id_str}",
             "unique_id": unique_id,

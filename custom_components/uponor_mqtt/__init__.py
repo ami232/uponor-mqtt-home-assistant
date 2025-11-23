@@ -42,6 +42,12 @@ async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
     manual = entry.data.get("manual_mqtt")
     discovery_prefix = entry.data.get("discovery_prefix")
     bridge = HAUponorBridge(hass, manual_mqtt=manual, discovery_prefix=discovery_prefix)
+    _LOGGER.info(
+        "Setting up Uponor entry %s (manual_mqtt=%s, discovery_prefix=%s)",
+        entry.entry_id,
+        bool(manual),
+        discovery_prefix,
+    )
     await bridge.async_start()
     hass.data[DOMAIN]["bridge"] = bridge
     hass.data[DOMAIN]["entry_id"] = entry.entry_id

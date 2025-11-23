@@ -1,5 +1,5 @@
 {
-    "domain": "uponor-mqtt-home-assistant",
+    "domain": "uponor_mqtt",
     "name": "Uponor MQTT Bridge",
     "version": "1.0.0",
     "documentation": "https://github.com/ami232/uponor-mqtt-home-assistant",
