@@ -1,0 +1,26 @@
+{
+    "title": "Uponor MQTT Bridge",
+    "config": {
+        "step": {
+            "user": {
+                "title": "Configure Uponor MQTT Bridge",
+                "description": "Configure the integration and select MQTT mode.",
+                "data": {
+                    "name": "Name",
+                    "use_core_mqtt": "Use Core MQTT",
+                    "discovery_prefix": "Discovery Prefix"
+                }
+            },
+            "manual": {
+                "title": "Manual MQTT Broker",
+                "description": "Enter MQTT broker connection details for manual mode.",
+                "data": {
+                    "host": "Host",
+                    "port": "Port",
+                    "username": "Username",
+                    "password": "Password"
+                }
+            }
+        }
+    }
+}

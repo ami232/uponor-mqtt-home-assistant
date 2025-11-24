@@ -1,75 +1,68 @@
-# Uponor MQTT Bridge (Home Assistant custom integration)
+# Uponor MQTT Bridge - Home Assistant custom integration
 
-Home Assistant custom integration that bridges Uponor Smatrix floor-heating thermostats to MQTT and exposes them as climate entities.
+Small integration that bridges Uponor Smatrix floor-heating thermostats to MQTT and to native Home Assistant `climate` entities.
 
-Features
-- Publishes thermostat state via MQTT discovery and also exposes native `climate` entities.
-- Supports two modes:
-  - Use Home Assistant's `mqtt` integration (default).
-  - Manual MQTT broker managed by the integration (via `paho-mqtt`).
-- Time synchronization to the bus when a time-master thermostat is detected.
+# Install via HACS and setup
 
-Topics used
-- `uponor_read` (binary): input topic with raw Uponor packet bytes. The integration
-  subscribes without forcing UTF-8 decoding so binary payloads are delivered as
-  raw bytes to the bridge callback.
-- `uponor_write` (binary): output topic where the integration publishes command packets.
-- `homeassistant/climate/uponor_<ID>/...`: MQTT discovery and state topics (discovery prefix configurable).
+Prerequisites
+- Home Assistant with HACS (Home Assistant Community Store) already installed and configured.
+- Your MQTT broker configured in Home Assistant (recommended) or credentials available if you plan to use the integration's manual broker mode.
 
-Installation
-1. Copy the `uponor_mqtt` folder into your Home Assistant `custom_components` directory so you have:
+Add and install the integration via HACS
 
-   `config/custom_components/uponor_mqtt/`
+1. Open Home Assistant and go to **HACS → Integrations**.
+2. If this repository is already published to GitHub and available in HACS, search for "Uponor MQTT Bridge" and click **Install**.
+3. If the repository is not in HACS core listings, add it as a custom repository:
+  - In HACS go to the three‑dot menu (top right) → **Custom repositories**.
+  - Add the repository URL (example): `https://github.com/ami232/uponor-mqtt-home-assistant`.
+  - Set **Category** to **Integration**, then click **Add**.
+  - Return to **HACS → Integrations**, search for the integration and click **Install**.
+4. After installation, restart Home Assistant when prompted.
 
-   (The repository already contains the integration files under `custom_components/uponor_mqtt`.)
+Add the integration in Home Assistant
 
-2. Restart Home Assistant.
+1. Go to **Settings → Devices & Services → Add Integration**.
+2. Search for "Uponor MQTT Bridge" and follow the configuration flow.
 
-3. Configure the integration via UI: Settings → Devices & Services → Add Integration → search `Uponor MQTT Bridge`.
+Configuration options (UI)
+- **Name**: Friendly name for the integration (default: "Uponor MQTT Bridge").
+- **Use core MQTT**: Recommended (checked by default). When enabled the integration will use Home Assistant's `mqtt` integration and its configured broker.
+- **Discovery prefix**: Defaults to `homeassistant`. Change only if your broker uses a different discovery prefix.
 
-Configuration (Config Flow)
-When adding the integration you will see a form with the following options:
+Manual broker mode
 
-- Name: Friendly name for the integration (default: "Uponor MQTT Bridge").
-- Use core MQTT: If checked (default) the integration will use Home Assistant's `mqtt` integration and the configured broker. Leave this checked if you already have the `MQTT` integration set up.
-- Discovery prefix: MQTT discovery prefix (default: `homeassistant`). Set this if your broker uses a different prefix.
+If you uncheck **Use core MQTT**, the integration will ask for manual broker details. Provide:
+- Host
+- Port
+- Username
+- Password
 
-Manual broker (optional)
-If you uncheck `Use core MQTT` the flow will ask for manual broker settings that the integration will use directly:
+The integration will create and manage a `paho-mqtt` client in this mode. Using Home Assistant's `mqtt` integration is recommended to avoid duplicate clients.
 
-- Host, Port, Username, Password - the integration will create a `paho-mqtt` client and manage its own connection.
+Verify installation
 
-Notes about modes
-- Preferred mode: use Home Assistant's `mqtt` integration. That allows a single broker configuration and avoids duplicate broker clients.
-- Manual mode is useful when you want the integration to manage a dedicated connection or when Home Assistant's core MQTT is not available.
+- After setup the integration will create `climate` entities for detected thermostats (for example `climate.uponor_00A1`).
+- Check the Home Assistant logs for `custom_components.uponor_mqtt` messages if entities do not appear.
 
-Using the entities
-- After discovery the integration creates `climate` entities like `climate.uponor_00A1`.
-- You can set target temperature from the UI; entities call into the bridge which builds the proper Uponor bus packet and publishes it to `uponor_write`.
+Troubleshooting (brief)
+- If entities do not appear, confirm `uponor_read` packets are arriving at your MQTT broker (the integration subscribes to raw/binary payloads).
+- If manual broker mode fails to connect, ensure the `paho-mqtt` dependency is present for Home Assistant and that credentials are correct.
 
-Developer notes
-- Protocol helpers are bundled in `custom_components/uponor_mqtt/uponor_protocol.py`.
-- Core bridge logic is in `custom_components/uponor_mqtt/bridge.py`.
-- The climate entity implementation is in `custom_components/uponor_mqtt/climate.py` and uses `DataUpdateCoordinator`.
+**Topics & Payloads**
 
-Project layout
-- `custom_components/uponor_mqtt/` — integration code (bridge, protocol helpers, entities).
-- `uponor_devices.json` — optional device metadata (if present).
-- `uponor-mqtt/` — standalone Python helper and Docker compose for running a translator outside HA (kept for reference).
+- `uponor_read` (binary): Input topic for raw Uponor packet bytes. The integration subscribes without forcing UTF‑8 decoding so it receives binary payloads.
+- `uponor_write` (binary): Output topic where the integration publishes command packets to be sent to the bus.
+- `homeassistant/climate/uponor_<ID>/...`: MQTT discovery and state/control topics created by the integration using the configured discovery prefix.
 
-Notes
-- This repository contains the Home Assistant custom integration; installation copies
-  `custom_components/uponor_mqtt` into your HA `config/custom_components` directory.
-- If you want, I can prepare a HACS package metadata update or add example scripts
-  for generating test packets.
+You normally do not need to publish to these topics manually - the integration handles reading and writing packets for discovered devices.
 
-Troubleshooting
-- If entities do not appear: verify that `uponor_read` messages are arriving on the broker and contain valid packets. The bridge uses CRC checking and will ignore invalid packets.
-- Check Home Assistant logs for messages from the integration (logger name: `custom_components.uponor_mqtt`).
-- If using manual broker mode, ensure the `paho-mqtt` dependency is installed by Home Assistant (it will be requested from the manifest). If the integration cannot import `paho`, it will log the failure and attempt to fall back to HA MQTT helper if available.
+**Using the discovered entities**
 
-Testing
-- Send sample packets to `uponor_read` on the broker (binary payloads). The original repository contains tooling and examples for building command packets in `uponor_protocol.py`.
+- After discovery the integration creates `climate` entities (for example `climate.uponor_00A1`).
+- Use the Home Assistant UI or automations to set target temperatures; the integration translates those actions into Uponor bus command packets and publishes them to `uponor_write`.
 
-License and contributions
-- This project is provided as-is. If you want me to help polish this integration (add tests, CI, HACS metadata), say which task you'd like next.
+**Troubleshooting**
+
+- Entities don't appear: verify that `uponor_read` messages are arriving on your MQTT broker and contain valid Uponor packets. The bridge validates packets (CRC) and will ignore invalid frames.
+- Check Home Assistant logs for messages from `custom_components.uponor_mqtt` for hints and errors.
+- If using manual broker mode, ensure the `paho-mqtt` Python package is available to Home Assistant (the integration manifest requests it). If `paho` cannot be imported the integration will log the failure and attempt to fall back to the HA MQTT helper if available.
