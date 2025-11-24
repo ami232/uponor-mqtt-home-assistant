@@ -427,7 +427,7 @@ class HAUponorBridge:
         config = {
             "name": f"Uponor {device_id_str}",
             "unique_id": unique_id,
-            "object_id": f"uponor_{device_id_str.lower()}",
+            "default_entity_id": f"climate.uponor_{device_id_str.lower()}",
             "device": {
                 "identifiers": [unique_id],
                 "name": f"Uponor Thermostat {device_id_str}",
