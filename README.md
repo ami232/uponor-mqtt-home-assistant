@@ -103,7 +103,7 @@ Each thermostat also gets these sensors, created once it reports the value:
 
 The controller only opens a channel when the thermostat registered to it asks for heat. A virtual thermostat lets Home Assistant be that thermostat. It registers on the bus like a T-148 and reports the temperature of any Home Assistant sensor, for example a Zigbee thermometer in a room that has no Uponor thermostat. The controller then switches the channel's actuators itself, using that temperature and the setpoint you set in Home Assistant.
 
-It has been tested on a Smatrix Base Pulse X-245 with T-148 thermostats and an Elfin EW41B. **Heat only.** While the controller is in cooling mode, and whenever the sensor is unavailable or hasn't reported for 30 minutes, it reports a temperature that doesn't ask for heat.
+It has been tested on a Smatrix Base Pulse X-245 with T-148 thermostats and an Elfin EW41B. **Heat only.** While the controller is in cooling mode, and whenever the sensor is unavailable, it reports a temperature that doesn't ask for heat.
 
 **Why it needs a TCP socket.** The controller expects an answer within a few tens of milliseconds of polling a thermostat. Through the EW41B's MQTT client the round trip measured 100–270 ms, which is too slow. Through its raw TCP socket it measured about 45 ms, which the controller accepts. The virtual thermostat therefore talks to the gateway over TCP; everything else stays on MQTT.
 

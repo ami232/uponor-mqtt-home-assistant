@@ -47,8 +47,6 @@ DEFAULT_HUMIDITY = 50
 ECO_SETBACK_RAW = 0x0048
 # A T-148 repeats a changed setpoint in a few replies; do the same
 SETPOINT_ANNOUNCEMENTS = 3
-# Room temperature older than this is not trusted
-SENSOR_MAX_AGE = 30 * 60
 # Margin used to report "no demand" (2 C, in tenths of F)
 NO_DEMAND_MARGIN_RAW = 36
 COOLING_BIT = 0x1000
@@ -160,9 +158,10 @@ class VirtualThermostat:
     def _sensor_value(self, entity_id: str | None) -> float | None:
         if entity_id is None or (state := self.hass.states.get(entity_id)) is None:
             return None
+        # Zigbee sensors often only report on change, so a stable room can go
+        # hours without an update; rely on the sensor's integration to mark
+        # it unavailable when it has really gone quiet
         if state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            return None
-        if time.time() - state.last_reported.timestamp() > SENSOR_MAX_AGE:
             return None
         try:
             return float(state.state)
