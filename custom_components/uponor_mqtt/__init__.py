@@ -11,24 +11,50 @@ from __future__ import annotations
 
 import logging
 
+import voluptuous as vol
 from homeassistant.components import mqtt
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+)
+from homeassistant.exceptions import ConfigEntryNotReady, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
 
 from .bridge import HAUponorBridge
 from .const import (
+    CAPTURE_FILE,
+    CONF_CAPTURE,
     CONF_DISCOVERY_PREFIX,
     CONF_READ_TOPIC,
     CONF_SYSTEM_ID,
+    CONF_VIRTUAL_DEVICE_ID,
+    CONF_VIRTUAL_HOST,
+    CONF_VIRTUAL_HUMIDITY,
+    CONF_VIRTUAL_PORT,
+    CONF_VIRTUAL_TEMPERATURE,
     CONF_WRITE_TOPIC,
     DEFAULT_READ_TOPIC,
+    DEFAULT_VIRTUAL_PORT,
     DEFAULT_WRITE_TOPIC,
     DOMAIN,
     HA_DISCOVERY_PREFIX,
 )
+from .virtual import VirtualThermostat
 
 _LOGGER = logging.getLogger(__name__)
+
+SERVICE_CAPTURE_NOTE = "capture_note"
+CAPTURE_NOTE_SCHEMA = vol.Schema({vol.Required("text"): cv.string})
+SERVICE_MEASURE_LATENCY = "measure_latency"
+MEASURE_LATENCY_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): vol.Match(r"^[0-9A-Fa-f]{4}$"),
+        vol.Optional("count", default=20): vol.All(int, vol.Range(min=1, max=50)),
+    }
+)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -39,6 +65,58 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """
     # keep minimal setup; real start occurs in config entries
     hass.data.setdefault(DOMAIN, {})
+
+    async def _capture_note(call: ServiceCall) -> None:
+        bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
+        if bridge is None or not bridge.capturing:
+            raise ServiceValidationError(
+                "Bus capture is off; enable it in the integration options"
+            )
+        bridge.capture("note", text=call.data["text"])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_CAPTURE_NOTE, _capture_note, schema=CAPTURE_NOTE_SCHEMA
+    )
+
+    async def _measure_latency(call: ServiceCall) -> ServiceResponse:
+        bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
+        if bridge is None:
+            raise ServiceValidationError("Uponor MQTT Bridge is not loaded")
+        return await bridge.async_measure_latency(
+            call.data["device_id"], call.data["count"]
+        )
+
+    def _virtual() -> VirtualThermostat:
+        bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
+        if bridge is None or bridge.virtual is None:
+            raise ServiceValidationError(
+                "No virtual thermostat; configure one in the integration options"
+            )
+        return bridge.virtual
+
+    async def _register_virtual(call: ServiceCall) -> None:
+        _virtual().open_registration()
+
+    async def _start_virtual(call: ServiceCall) -> None:
+        _virtual().set_answering(True)
+
+    async def _stop_virtual(call: ServiceCall) -> None:
+        _virtual().set_answering(False)
+
+    for name, handler in (
+        ("register_virtual_thermostat", _register_virtual),
+        ("start_virtual_thermostat", _start_virtual),
+        ("stop_virtual_thermostat", _stop_virtual),
+    ):
+        hass.services.async_register(DOMAIN, name, handler)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MEASURE_LATENCY,
+        _measure_latency,
+        schema=MEASURE_LATENCY_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
+    )
     return True
 
 
@@ -63,10 +141,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         write_topic=config.get(CONF_WRITE_TOPIC) or DEFAULT_WRITE_TOPIC,
         discovery_prefix=config.get(CONF_DISCOVERY_PREFIX) or HA_DISCOVERY_PREFIX,
         system_id=config.get(CONF_SYSTEM_ID),
+        capture_path=hass.config.path(CAPTURE_FILE)
+        if config.get(CONF_CAPTURE)
+        else None,
     )
     _LOGGER.info("Setting up Uponor entry %s", entry.entry_id)
     await bridge.async_start()
     hass.data[DOMAIN]["bridge"] = bridge
+
+    if all(
+        config.get(key)
+        for key in (CONF_VIRTUAL_HOST, CONF_VIRTUAL_DEVICE_ID, CONF_VIRTUAL_TEMPERATURE)
+    ):
+        bridge.virtual = VirtualThermostat(
+            hass,
+            bridge,
+            host=config[CONF_VIRTUAL_HOST],
+            port=config.get(CONF_VIRTUAL_PORT) or DEFAULT_VIRTUAL_PORT,
+            device_id=config[CONF_VIRTUAL_DEVICE_ID],
+            temperature_entity=config[CONF_VIRTUAL_TEMPERATURE],
+            humidity_entity=config.get(CONF_VIRTUAL_HUMIDITY),
+        )
+        await bridge.virtual.async_start()
+        _LOGGER.warning(
+            "Experimental virtual thermostat %s enabled (gateway TCP %s)",
+            bridge.virtual.device_id,
+            config[CONF_VIRTUAL_HOST],
+        )
     hass.data[DOMAIN]["entry_id"] = entry.entry_id
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
@@ -82,6 +183,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
     if bridge is not None:
+        if bridge.virtual is not None:
+            await bridge.virtual.async_stop()
         await bridge.async_stop()
     hass.data.pop(DOMAIN, None)
     return True

@@ -8,13 +8,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Callable
-from typing import Any
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import mqtt, persistent_notification
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -24,13 +27,18 @@ from .const import (
     HA_DISCOVERY_PREFIX,
 )
 from .uponor_protocol import (
+    REGISTRATION_BROADCAST,
     UponorThermostat,
+    build_poll_packet,
     build_setpoint_packet,
     build_time_command_packet,
     parse_uponor_packet,
     split_packets,
     temp_to_uponor,
 )
+
+if TYPE_CHECKING:
+    from .virtual import VirtualThermostat
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +49,18 @@ SENSORS: dict[str, tuple[str, str, str]] = {
     "current_humidity": ("Humidity", "humidity", "%"),
     "temperature": ("Target temperature", "temperature", "°C"),
 }
+
+CAPTURE_FLUSH_INTERVAL = timedelta(seconds=5)
+
+# Bus silence after a poll cycle before a latency probe may transmit; the
+# controller polls every 10 s and a cycle takes about 1 s
+PROBE_QUIET = 3.0
+PROBE_TIMEOUT = 2.0
+
+
+def _append_lines(path: str, lines: list[str]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.writelines(lines)
 
 
 class HAUponorBridge:
@@ -60,6 +80,7 @@ class HAUponorBridge:
         write_topic: str = DEFAULT_WRITE_TOPIC,
         discovery_prefix: str | None = None,
         system_id: int | None = None,
+        capture_path: str | None = None,
     ) -> None:
         self.hass = hass
         self._time_device_id: str | None = None
@@ -79,6 +100,48 @@ class HAUponorBridge:
         self._system_id = system_id
         self._warned_sys_ids: set[int] = set()
         self._unsubscribers: list[Callable[[], None]] = []
+        # Raw bus capture for protocol analysis (tools/analyze_capture.py)
+        self._capture_path = capture_path
+        self._capture_lines: list[str] = []
+        self._capture_unsub: Callable[[], None] | None = None
+        # Bus timing, for latency probes
+        self._last_rx = 0.0
+        self._last_registration_broadcast = 0.0
+        self._probe: tuple[str, asyncio.Future[float]] | None = None
+        self.virtual: VirtualThermostat | None = None
+
+    @property
+    def system_id(self) -> int | None:
+        return self._system_id
+
+    @property
+    def capturing(self) -> bool:
+        return self._capture_path is not None
+
+    def capture(self, direction: str, raw: bytes | None = None, **extra: Any) -> None:
+        """Queue one capture line: `rx`/`tx` bus bytes or a `note`."""
+        if self._capture_path is None:
+            return
+        entry: dict[str, Any] = {
+            "ts": round(time.time(), 6),
+            "mono": round(time.monotonic(), 6),
+            "dir": direction,
+        }
+        if raw is not None:
+            entry["hex"] = raw.hex()
+        entry.update(extra)
+        self._capture_lines.append(json.dumps(entry) + "\n")
+
+    async def _async_flush_capture(self, _now: Any = None) -> None:
+        if self._capture_path is None or not self._capture_lines:
+            return
+        lines, self._capture_lines = self._capture_lines, []
+        try:
+            await self.hass.async_add_executor_job(
+                _append_lines, self._capture_path, lines
+            )
+        except OSError as exc:
+            _LOGGER.error("Failed to write bus capture %s: %s", self._capture_path, exc)
 
     async def async_start(self) -> None:
         """Start subscriptions and background tasks."""
@@ -131,6 +194,13 @@ class HAUponorBridge:
             # Defer setup so Home Assistant will retry later
             raise ConfigEntryNotReady("MQTT integration not ready") from exc
 
+        if self._capture_path is not None:
+            self._capture_unsub = async_track_time_interval(
+                self.hass, self._async_flush_capture, CAPTURE_FLUSH_INTERVAL
+            )
+            self.capture("note", text="capture started")
+            _LOGGER.warning("Capturing raw bus traffic to %s", self._capture_path)
+
         # Start time sync background task
         loop = asyncio.get_running_loop()
         self._time_task = loop.create_task(self._time_sync_loop())
@@ -156,6 +226,11 @@ class HAUponorBridge:
             except Exception:
                 _LOGGER.debug("Time sync task ended with an error", exc_info=True)
             self._time_task = None
+        if self._capture_unsub is not None:
+            self._capture_unsub()
+            self._capture_unsub = None
+            self.capture("note", text="capture stopped")
+            await self._async_flush_capture()
         # keep caches for now; nothing else to clean up
 
     async def _publish(
@@ -167,12 +242,82 @@ class HAUponorBridge:
         except Exception as exc:
             _LOGGER.exception("Failed to publish %s: %s", topic, exc)
 
+    async def _write_bus(self, buffer: bytes, qos: int = 1) -> None:
+        """Send raw bytes to the bus through the gateway."""
+        self.capture("tx", buffer)
+        # Bus writes must not be retained, or the gateway replays them on reconnect
+        await self._publish(self._write_topic, buffer, qos=qos, retain=False)
+
+    async def _async_wait_bus_idle(self) -> None:
+        """Wait for the next poll cycle to finish and the bus to go quiet."""
+        start = time.monotonic()
+        while self._last_rx <= start or time.monotonic() - self._last_rx < PROBE_QUIET:
+            if self._last_registration_broadcast > start - 10:
+                raise HomeAssistantError("Controller is in registration mode")
+            if time.monotonic() - start > 60:
+                raise HomeAssistantError("No bus traffic for 60 s")
+            await asyncio.sleep(0.05)
+
+    async def async_measure_latency(self, device_id: str, count: int) -> dict[str, Any]:
+        """Time poll -> reply round trips to a thermostat through the gateway.
+
+        Sends the controller's own poll to `device_id` while the bus is idle
+        between poll cycles and waits for the thermostat's reply on the read
+        topic. This is the path a reply from Home Assistant would take, so it
+        shows whether HA can answer the controller in time.
+        """
+        if self._system_id is None:
+            raise HomeAssistantError("Uponor system ID not known yet")
+        if self._probe is not None:
+            raise HomeAssistantError("A latency measurement is already running")
+        device_id = device_id.upper()
+        poll = build_poll_packet(self._system_id, device_id)
+        loop = asyncio.get_running_loop()
+        round_trips: list[float | None] = []
+        for _ in range(count):
+            await self._async_wait_bus_idle()
+            future: asyncio.Future[float] = loop.create_future()
+            self._probe = (device_id, future)
+            sent = time.monotonic()
+            try:
+                await self._write_bus(poll, qos=0)
+                received = await asyncio.wait_for(future, PROBE_TIMEOUT)
+                round_trips.append(round((received - sent) * 1000, 1))
+            except TimeoutError:
+                round_trips.append(None)
+            finally:
+                self._probe = None
+
+        replies = sorted(r for r in round_trips if r is not None)
+        result: dict[str, Any] = {
+            "device_id": device_id,
+            "polls": count,
+            "replies": len(replies),
+            "round_trips_ms": round_trips,
+        }
+        if replies:
+            result.update(
+                min_ms=replies[0],
+                median_ms=replies[len(replies) // 2],
+                p90_ms=replies[max(0, int(len(replies) * 0.9) - 1)],
+                max_ms=replies[-1],
+            )
+        _LOGGER.info("Latency measurement: %s", result)
+        return result
+
     def _base_topic(self, device_id_str: str) -> str:
         return f"{self._discovery_prefix}/climate/uponor_{device_id_str}"
 
     async def _on_message_reader(self, msg) -> None:  # callback from mqtt
         """Handle incoming raw bus packets from the read topic."""
         payload: bytes = msg.payload
+        received = time.monotonic()
+        self._last_rx = received
+        if isinstance(payload, bytes):
+            # Before parsing, so frames the parser rejects are kept too
+            self.capture("rx", payload)
+            if REGISTRATION_BROADCAST in payload:
+                self._last_registration_broadcast = received
         try:
             plen = len(payload)
         except Exception:
@@ -196,6 +341,13 @@ class HAUponorBridge:
             if not packet:
                 _LOGGER.debug("Failed to parse uponor packet: %s", raw_pkt.hex())
                 continue
+            if (
+                self._probe is not None
+                and f"{packet['device_id']:04X}" == self._probe[0]
+                and "current_temperature" in packet
+                and not self._probe[1].done()
+            ):
+                self._probe[1].set_result(received)
             await self._handle_packet(packet)
 
     async def _handle_packet(self, packet: dict[str, Any]) -> None:
@@ -218,6 +370,16 @@ class HAUponorBridge:
         if packet.get("special_ff"):
             # Controller polling a device; carries no data
             return
+
+        if (
+            self.virtual is not None
+            and device_id_str == self.virtual.device_id
+            and not packet.get("virtual")
+        ):
+            # The controller's frame to our virtual thermostat. It echoes the
+            # setpoint it last heard from us, which may lag a change made here.
+            self.virtual.on_controller_packet(packet)
+            packet = {k: v for k, v in packet.items() if k != "temperature"}
 
         thermostat = self._thermostats.setdefault(device_id_str, UponorThermostat())
         thermostat.update(packet)
@@ -275,6 +437,10 @@ class HAUponorBridge:
                 sys_id,
             )
             await self._send_time_if_ready()
+
+    async def async_virtual_state(self, packet: dict[str, Any]) -> None:
+        """Publish the virtual thermostat's own readings like a real thermostat's."""
+        await self._handle_packet({**packet, "virtual": True})
 
     async def _publish_discovery(
         self, device_id_str: str, sys_id: int, thermostat: UponorThermostat
@@ -369,6 +535,15 @@ class HAUponorBridge:
         _LOGGER.debug(
             "API set temperature request for %s -> %s", device_id, temperature
         )
+        if self.virtual is not None and device_id == self.virtual.device_id:
+            # Our own thermostat: it announces the new setpoint in its replies
+            self.virtual.set_target(temperature)
+            await self._publish(
+                f"{self._base_topic(device_id)}/temperature", str(temperature)
+            )
+            self._published.setdefault(device_id, {})["temperature"] = temperature
+            _LOGGER.info("[%s] Virtual thermostat setpoint %.1f°C", device_id, temperature)
+            return
         device_state = self.device_state_cache.get(device_id)
         thermostat = self._thermostats.get(device_id)
         if device_state and thermostat:
@@ -392,8 +567,7 @@ class HAUponorBridge:
 
         try:
             buffer = build_setpoint_packet(sys_id, device_id.lower(), raw)
-            # Bus writes must not be retained, or the gateway replays them on reconnect
-            await self._publish(self._write_topic, buffer, retain=False)
+            await self._write_bus(buffer)
             _LOGGER.info(
                 "[%s] Set temperature: HA=%.1f°C, bus raw=%d (sys_id=0x%04X)",
                 device_id,
@@ -482,7 +656,7 @@ class HAUponorBridge:
             # Use HA's configured time zone, not the container's
             now = dt_util.now()
             buf = build_time_command_packet(sys_id, dev_id.lower(), now)
-            await self._publish(self._write_topic, buf, retain=False)
+            await self._write_bus(buf)
             self._last_time_sync = asyncio.get_event_loop().time()
             self._last_time_sync_offset = now.utcoffset()
             _LOGGER.info("[%s] Sent time synchronization (%s)", dev_id, now.isoformat())

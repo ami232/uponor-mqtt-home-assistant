@@ -8,18 +8,27 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers import selector
 
 from .const import (
+    CONF_CAPTURE,
     CONF_DISCOVERY_PREFIX,
     CONF_READ_TOPIC,
     CONF_SYSTEM_ID,
+    CONF_VIRTUAL_DEVICE_ID,
+    CONF_VIRTUAL_HOST,
+    CONF_VIRTUAL_HUMIDITY,
+    CONF_VIRTUAL_PORT,
+    CONF_VIRTUAL_TEMPERATURE,
     CONF_WRITE_TOPIC,
     DEFAULT_NAME,
     DEFAULT_READ_TOPIC,
+    DEFAULT_VIRTUAL_PORT,
     DEFAULT_WRITE_TOPIC,
     DOMAIN,
     HA_DISCOVERY_PREFIX,
 )
+from .virtual import parse_device_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +94,52 @@ def _validate_bus_input(
     return data
 
 
+def _virtual_schema(defaults: dict[str, Any]) -> dict:
+    """Optional experimental virtual thermostat settings."""
+
+    def suggested(key: str) -> dict:
+        return {"suggested_value": defaults.get(key)}
+
+    return {
+        vol.Optional(CONF_VIRTUAL_HOST, description=suggested(CONF_VIRTUAL_HOST)): str,
+        vol.Optional(
+            CONF_VIRTUAL_PORT,
+            default=defaults.get(CONF_VIRTUAL_PORT, DEFAULT_VIRTUAL_PORT),
+        ): vol.All(int, vol.Range(min=1, max=65535)),
+        vol.Optional(
+            CONF_VIRTUAL_DEVICE_ID, description=suggested(CONF_VIRTUAL_DEVICE_ID)
+        ): str,
+        vol.Optional(
+            CONF_VIRTUAL_TEMPERATURE, description=suggested(CONF_VIRTUAL_TEMPERATURE)
+        ): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor", device_class="temperature")
+        ),
+        vol.Optional(
+            CONF_VIRTUAL_HUMIDITY, description=suggested(CONF_VIRTUAL_HUMIDITY)
+        ): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor", device_class="humidity")
+        ),
+    }
+
+
+def _validate_virtual_input(
+    user_input: dict[str, Any], errors: dict[str, str]
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        CONF_VIRTUAL_HOST: (user_input.get(CONF_VIRTUAL_HOST) or "").strip() or None,
+        CONF_VIRTUAL_PORT: user_input.get(CONF_VIRTUAL_PORT, DEFAULT_VIRTUAL_PORT),
+        CONF_VIRTUAL_DEVICE_ID: None,
+        CONF_VIRTUAL_TEMPERATURE: user_input.get(CONF_VIRTUAL_TEMPERATURE) or None,
+        CONF_VIRTUAL_HUMIDITY: user_input.get(CONF_VIRTUAL_HUMIDITY) or None,
+    }
+    if device_id := (user_input.get(CONF_VIRTUAL_DEVICE_ID) or "").strip():
+        try:
+            data[CONF_VIRTUAL_DEVICE_ID] = parse_device_id(device_id)
+        except ValueError:
+            errors[CONF_VIRTUAL_DEVICE_ID] = "invalid_device_id"
+    return data
+
+
 class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for the Uponor MQTT Bridge."""
 
@@ -136,12 +191,17 @@ class UponorMQTTOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = _validate_bus_input(user_input, errors)
+            data[CONF_CAPTURE] = user_input.get(CONF_CAPTURE, False)
+            data.update(_validate_virtual_input(user_input, errors))
             if not errors:
                 return self.async_create_entry(data=data)
 
         current = {**self.config_entry.data, **self.config_entry.options}
+        schema = {
+            **_bus_schema(current),
+            vol.Optional(CONF_CAPTURE, default=current.get(CONF_CAPTURE, False)): bool,
+            **_virtual_schema(current),
+        }
         return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(_bus_schema(current)),
-            errors=errors,
+            step_id="init", data_schema=vol.Schema(schema), errors=errors
         )

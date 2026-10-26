@@ -96,6 +96,29 @@ def test_request_frame():
     assert parsed["sys_id"] == 0x110B
 
 
+def test_poll_packet_matches_controller():
+    # Poll the X-245 sent to thermostat 42A5 (system 1108), from a bus capture
+    assert proto.build_poll_packet(0x1108, "42a5").hex() == "110842a5ff4167"
+
+
+def test_registration_packets_match_t148():
+    # What T-148 42A5 sent after the X-245's registration broadcast
+    assert [f.hex() for f in proto.build_registration_packets(0x1108, "42A5")] == [
+        "110842a5fa3f0c030fe5",
+        "110842a5fb40a4",
+        "110842a5fc0166",
+    ]
+
+
+def test_reply_packet_matches_t148():
+    # A T-148 reply to a poll: room 25.2 C, preset 0, mode2, humidity 36 %
+    fields = [(0x40, 0x0305), (0x3E, 0x0000), (0x3F, 0x0C03), (0x42, 0x9624)]
+    assert (
+        proto.build_fields_packet(0x1108, "42A5", fields).hex()
+        == "110842a54003053e00003f0c0342962468a3"
+    )
+
+
 def _thermostat(*frames: list[tuple[int, int]]) -> "proto.UponorThermostat":
     thermostat = proto.UponorThermostat()
     for fields in frames:

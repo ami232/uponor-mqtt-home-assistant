@@ -1,0 +1,53 @@
+capture_note:
+  name: Add capture note
+  description: >-
+    Write a timestamped note into the raw bus capture, e.g. before each step
+    of a thermostat registration. Bus capture must be on in the options.
+  fields:
+    text:
+      name: Text
+      description: Note to record.
+      required: true
+      example: "Pressed OK on controller, registration mode on channel 3"
+      selector:
+        text:
+
+measure_latency:
+  name: Measure bus latency
+  description: >-
+    Experimental. Sends the controller's poll to a thermostat while the bus is
+    idle and times its reply through the gateway, to see how fast Home
+    Assistant can answer on the bus. Transmits on the heating bus.
+  fields:
+    device_id:
+      name: Device ID
+      description: Thermostat bus address (4 hex digits, from the entity ID).
+      required: true
+      example: "42A5"
+      selector:
+        text:
+    count:
+      name: Count
+      description: Number of polls, one per 10 s poll cycle.
+      default: 20
+      selector:
+        number:
+          min: 1
+          max: 50
+
+register_virtual_thermostat:
+  name: Register virtual thermostat
+  description: >-
+    Experimental. For the next 60 s, answer the controller's registration
+    broadcast as the virtual thermostat. Arm the channel on the controller
+    first (hold OK, pick the channel, press OK).
+
+start_virtual_thermostat:
+  name: Start virtual thermostat
+  description: Experimental. Resume answering the controller's polls.
+
+stop_virtual_thermostat:
+  name: Stop virtual thermostat
+  description: >-
+    Experimental. Stop answering the controller's polls, as if the thermostat
+    had failed. The controller then runs its fallback on that channel.

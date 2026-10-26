@@ -31,12 +31,19 @@
                     "read_topic": "Read topic (gateway publishes bus bytes here)",
                     "write_topic": "Write topic (gateway sends these bytes to the bus)",
                     "discovery_prefix": "MQTT discovery prefix",
-                    "system_id": "System ID (hex, e.g. 110B; blank = auto-detect)"
+                    "system_id": "System ID (hex, e.g. 110B; blank = auto-detect)",
+                    "capture": "Capture raw bus traffic to uponor_capture.jsonl (debug)",
+                    "virtual_tcp_host": "Virtual thermostat (experimental): gateway TCP host",
+                    "virtual_tcp_port": "Virtual thermostat: gateway TCP port",
+                    "virtual_device_id": "Virtual thermostat: bus device ID (4 hex digits, unused)",
+                    "virtual_temperature_entity": "Virtual thermostat: room temperature sensor",
+                    "virtual_humidity_entity": "Virtual thermostat: humidity sensor (optional)"
                 }
             }
         },
         "error": {
-            "invalid_system_id": "System ID must be a hexadecimal value between 0000 and FFFF."
+            "invalid_system_id": "System ID must be a hexadecimal value between 0000 and FFFF.",
+            "invalid_device_id": "Device ID must be 4 hex digits, not 0000 or FFFF."
         }
     }
 }
