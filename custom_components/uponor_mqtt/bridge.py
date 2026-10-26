@@ -14,6 +14,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.components import mqtt
 from homeassistant.exceptions import HomeAssistantError, ConfigEntryNotReady
 from homeassistant.components import persistent_notification
+from homeassistant.util import dt as dt_util
 import types
 import asyncio as _asyncio
 
@@ -53,6 +54,7 @@ class HAUponorBridge:
         self.hass = hass
         self._time_device_id: str | None = None
         self._last_time_sync: float | None = None
+        self._last_time_sync_offset = None
         self._time_task: asyncio.Task | None = None
         # device caches
         self.discovered_devices: set[str] = set()
@@ -367,7 +369,8 @@ class HAUponorBridge:
         # Build command packet and publish to uponor_write (raw bytes)
         try:
             buffer = build_command_packet(sys_id, dev_id.lower(), temp_to_send)
-            await self._publish("uponor_write", buffer)
+            # Bus writes must not be retained, or the gateway replays them on reconnect
+            await self._publish("uponor_write", buffer, retain=False)
             _LOGGER.info(
                 "[%s] Set temperature: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
                 dev_id,
@@ -407,7 +410,7 @@ class HAUponorBridge:
 
         try:
             buffer = build_command_packet(sys_id, device_id.lower(), temp_to_send)
-            await self._publish("uponor_write", buffer)
+            await self._publish("uponor_write", buffer, retain=False)
             _LOGGER.info(
                 "[%s] Set temperature via API: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
                 device_id,
@@ -466,10 +469,13 @@ class HAUponorBridge:
         if sys_id is None:
             return
         try:
-            buf = build_time_command_packet(sys_id, dev_id.lower())
-            await self._publish("uponor_write", buf)
+            # Use HA's configured time zone, not the container's
+            now = dt_util.now()
+            buf = build_time_command_packet(sys_id, dev_id.lower(), now)
+            await self._publish("uponor_write", buf, retain=False)
             self._last_time_sync = asyncio.get_event_loop().time()
-            _LOGGER.info("[%s] Sent time synchronization", dev_id)
+            self._last_time_sync_offset = now.utcoffset()
+            _LOGGER.info("[%s] Sent time synchronization (%s)", dev_id, now.isoformat())
         except Exception as exc:
             _LOGGER.error("Failed to build/send time packet to %s: %s", dev_id, exc)
 
@@ -480,5 +486,8 @@ class HAUponorBridge:
             if self._last_time_sync is None:
                 await self._send_time_if_ready()
             elif (asyncio.get_event_loop().time() - self._last_time_sync) >= 24 * 3600:
+                await self._send_time_if_ready()
+            elif dt_util.now().utcoffset() != self._last_time_sync_offset:
+                # DST transition: resync right away instead of waiting up to 24h
                 await self._send_time_if_ready()
             await asyncio.sleep(30)
