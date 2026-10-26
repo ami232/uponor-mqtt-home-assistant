@@ -1,68 +1,154 @@
-# Uponor MQTT Bridge - Home Assistant custom integration
+# Uponor MQTT Bridge – Home Assistant custom integration
 
-Small integration that bridges Uponor Smatrix floor-heating thermostats to MQTT and to native Home Assistant `climate` entities.
+Connects Uponor Smatrix floor-heating thermostats to Home Assistant through MQTT. Each thermostat shows up as a `climate` entity, with its current temperature, target temperature, humidity, heating/cooling mode and action. Target temperatures set in Home Assistant are sent back to the thermostats.
 
-# Install via HACS and setup
+The integration also keeps the thermostat clock in sync with Home Assistant's time zone, including DST changes.
 
-Prerequisites
-- Home Assistant with HACS (Home Assistant Community Store) already installed and configured.
-- Your MQTT broker configured in Home Assistant (recommended) or credentials available if you plan to use the integration's manual broker mode.
+## How it works
 
-Add and install the integration via HACS
+```
+Uponor Smatrix controller ──RS485 bus──► RS485-to-Wi-Fi gateway ──MQTT──► Home Assistant
+   (thermostats on the bus)               (e.g. Elfin EW41B)                (this integration)
 
-1. Open Home Assistant and go to **HACS → Integrations**.
-2. If this repository is already published to GitHub and available in HACS, search for "Uponor MQTT Bridge" and click **Install**.
-3. If the repository is not in HACS core listings, add it as a custom repository:
-  - In HACS go to the three‑dot menu (top right) → **Custom repositories**.
-  - Add the repository URL (example): `https://github.com/ami232/uponor-mqtt-home-assistant`.
-  - Set **Category** to **Integration**, then click **Add**.
-  - Return to **HACS → Integrations**, search for the integration and click **Install**.
-4. After installation, restart Home Assistant when prompted.
+  bus bytes  ──► read topic  (default: uponor_read)  ──► parsed → climate entities (MQTT discovery)
+  bus bytes  ◄── write topic (default: uponor_write) ◄── target temperature / clock sync
+```
 
-Add the integration in Home Assistant
+The integration never talks to the bus directly. It needs a gateway that:
 
-1. Go to **Settings → Devices & Services → Add Integration**.
-2. Search for "Uponor MQTT Bridge" and follow the configuration flow.
+1. publishes the **raw bytes** it receives from the RS485 bus to an MQTT topic, and
+2. writes the raw bytes it receives on another MQTT topic to the bus.
 
-Configuration options (UI)
-- **Name**: Friendly name for the integration (default: "Uponor MQTT Bridge").
-- **Use core MQTT**: Recommended (checked by default). When enabled the integration will use Home Assistant's `mqtt` integration and its configured broker.
-- **Discovery prefix**: Defaults to `homeassistant`. Change only if your broker uses a different discovery prefix.
+Any gateway that does this works. The setup below uses the Elfin EW41B.
 
-Manual broker mode
+## Hardware: Elfin EW41B (reference setup)
 
-If you uncheck **Use core MQTT**, the integration will ask for manual broker details. Provide:
-- Host
-- Port
-- Username
-- Password
+The [Elfin EW41B](http://www.hi-flying.com/) is a small RS485-to-Wi-Fi converter with a built-in MQTT client.
 
-The integration will create and manage a `paho-mqtt` client in this mode. Using Home Assistant's `mqtt` integration is recommended to avoid duplicate clients.
+### Wiring
 
-Verify installation
+Connect the EW41B's RS485 **A/B** terminals to the bus terminals on the Uponor Smatrix controller (A to A, B to B). Power the EW41B from its supported supply range (see its datasheet). If the gateway receives nothing, swap A and B.
 
-- After setup the integration will create `climate` entities for detected thermostats (for example `climate.uponor_00A1`).
-- Check the Home Assistant logs for `custom_components.uponor_mqtt` messages if entities do not appear.
+### Serial settings
 
-Troubleshooting (brief)
-- If entities do not appear, confirm `uponor_read` packets are arriving at your MQTT broker (the integration subscribes to raw/binary payloads).
-- If manual broker mode fails to connect, ensure the `paho-mqtt` dependency is present for Home Assistant and that credentials are correct.
+Open the EW41B web UI. Out of the box it runs its own Wi-Fi access point at `10.10.100.254`, with the login `admin` / `admin`. Once it's on your network, use the IP your router gives it. Under **Serial Port Settings**:
 
-**Topics & Payloads**
+| Setting | Value |
+| --- | --- |
+| Baud rate | 19200 |
+| Data bits / parity / stop bits | 8 / None / 1 |
+| Flow control | Half duplex (RS485 direction control) |
+| Buffer size | 256 |
+| Gap time | 10 ms |
+| Protocol | None (transparent) |
 
-- `uponor_read` (binary): Input topic for raw Uponor packet bytes. The integration subscribes without forcing UTF‑8 decoding so it receives binary payloads.
-- `uponor_write` (binary): Output topic where the integration publishes command packets to be sent to the bus.
-- `homeassistant/climate/uponor_<ID>/...`: MQTT discovery and state/control topics created by the integration using the configured discovery prefix.
+### MQTT settings
 
-You normally do not need to publish to these topics manually - the integration handles reading and writing packets for discovered devices.
+Under **Communication Settings**, add a socket with protocol **MQTT** that points at the same broker Home Assistant uses:
 
-**Using the discovered entities**
+| Setting | Value |
+| --- | --- |
+| Server / port | your broker (e.g. the Mosquitto add-on, port 1883) |
+| MQTT version | 3.1 (the default; 3.1.1 also works with Mosquitto) |
+| Client ID | any unique name (e.g. `Elfin`) |
+| Username / password | an MQTT user on the broker |
+| Publish topic / QoS | `uponor_read` / 0 |
+| Subscribe topic / QoS | `uponor_write` / 0 |
+| Route | `uart` |
+| Connect mode | Always |
 
-- After discovery the integration creates `climate` entities (for example `climate.uponor_00A1`).
-- Use the Home Assistant UI or automations to set target temperatures; the integration translates those actions into Uponor bus command packets and publishes them to `uponor_write`.
+The 10 ms gap time makes the EW41B publish each bus frame as soon as the line goes quiet, so most MQTT messages contain a single frame. The integration also copes with several frames in one message, because it finds frame boundaries using the CRC.
 
-**Troubleshooting**
+Change the default `admin` password on the web UI. The page shows the MQTT password in plain text.
 
-- Entities don't appear: verify that `uponor_read` messages are arriving on your MQTT broker and contain valid Uponor packets. The bridge validates packets (CRC) and will ignore invalid frames.
-- Check Home Assistant logs for messages from `custom_components.uponor_mqtt` for hints and errors.
-- If using manual broker mode, ensure the `paho-mqtt` Python package is available to Home Assistant (the integration manifest requests it). If `paho` cannot be imported the integration will log the failure and attempt to fall back to the HA MQTT helper if available.
+If you use other topic names, enter them when you set up the integration.
+
+## Installation
+
+### HACS (recommended)
+
+1. In Home Assistant, open **HACS**, use the three-dot menu and choose **Custom repositories**.
+2. Add `https://github.com/ami232/uponor-mqtt-home-assistant` with the category **Integration**.
+3. Search for **Uponor MQTT Bridge**, install it and restart Home Assistant.
+
+### Manual
+
+Copy `custom_components/uponor_mqtt` into your Home Assistant `config/custom_components/` folder and restart.
+
+### Requirements
+
+- Home Assistant 2025.10 or newer.
+- The [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) set up and connected to the same broker as your gateway.
+
+## Configuration
+
+Go to **Settings → Devices & Services → Add Integration** and choose **Uponor MQTT Bridge**.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| Name | `Uponor MQTT Bridge` | Name of the integration entry. |
+| Read topic | `uponor_read` | Topic where the gateway publishes raw bus bytes. |
+| Write topic | `uponor_write` | Topic the gateway subscribes to and writes to the bus. |
+| MQTT discovery prefix | `homeassistant` | Change it only if your MQTT integration uses a different prefix. |
+| System ID | *(blank)* | Your controller's 2-byte bus address in hex (e.g. `110B`). Leave it blank and the integration detects it from bus traffic. |
+
+You can change all of these later with **Configure** on the integration. The integration reloads when you save.
+
+### System ID
+
+Every Uponor controller has its own system ID, and every bus frame starts with it. When you leave the field blank, the integration takes the ID from the first valid frame it receives and logs it:
+
+```
+Detected Uponor system ID 0x110B
+```
+
+Until the ID is known, temperature changes for thermostats that haven't sent any data yet are rejected. They are never sent to a guessed address. If you want commands to work right after a restart, set the ID explicitly.
+
+## Entities
+
+Each thermostat seen on the bus gets a climate entity named `climate.uponor_<device id>` (for example `climate.uponor_00a1`). It's created through MQTT discovery under `<discovery prefix>/climate/uponor_<ID>/…`. A thermostat appears once it has sent its first frame on the bus.
+
+## Troubleshooting
+
+**No entities appear**
+
+- Check that bus data reaches the broker:
+  ```
+  mosquitto_sub -h <broker> -u <user> -P <pass> -t uponor_read -F %x
+  ```
+  You should see hex frames that all start with the same two bytes (your system ID).
+- If nothing arrives, check the wiring (try swapping A/B), the serial settings and the gateway's MQTT settings.
+- Frames that fail the CRC check are dropped. A lot of them usually means a wrong baud rate.
+
+**Temperature changes do nothing**
+
+- Check that the gateway is subscribed to the write topic and has Wi-Fi/MQTT connectivity.
+- Look for `Cannot set temperature: Uponor system ID not known yet` in the log (see [System ID](#system-id)).
+
+**Debug logging**
+
+```yaml
+logger:
+  logs:
+    custom_components.uponor_mqtt: debug
+```
+
+## Limitations
+
+- One Uponor controller (one system ID) per Home Assistant instance.
+- Only target temperature can be set. Mode (heat/cool) and eco presets are read-only.
+- Temperatures are in °C.
+
+## Upgrading from 1.0.x
+
+- **Manual MQTT broker mode has been removed.** The integration now always uses Home Assistant's MQTT integration. Existing entries keep working and log a warning.
+- **Existing entries use the default topics** (`uponor_read` / `uponor_write`) and auto-detect the system ID. To change this, use **Configure**.
+
+## Development
+
+The protocol tests don't need Home Assistant:
+
+```
+pip install pytest
+pytest tests/
+```

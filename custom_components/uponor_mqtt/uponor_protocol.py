@@ -66,16 +66,33 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def split_packets(data: bytes) -> list[bytes]:
+def _is_valid_frame(pkt: bytes) -> bool:
+    # header (4) + payload (1 request byte or N 3-byte fields) + CRC (2)
+    if len(pkt) != 7 and (len(pkt) < 9 or (len(pkt) - 6) % 3 != 0):
+        return False
+    return crc16_modbus(pkt[:-2]) == int.from_bytes(pkt[-2:], "little")
+
+
+def split_packets(data: bytes, sys_id: int | None = None) -> list[bytes]:
+    """Split a raw bus buffer into CRC-valid packets.
+
+    Every frame starts with the 2-byte system ID of the controller. If
+    `sys_id` is not known yet, the first two bytes of the buffer are used.
+    """
+    if len(data) < 7:
+        return []
+    if _is_valid_frame(data):
+        return [data]
+    marker = sys_id.to_bytes(2, "big") if sys_id is not None else data[0:2]
     packets = []
     i = 0
     while i + 7 <= len(data):
-        if data[i] != 0x11 or data[i + 1] != 0x08:
+        if data[i : i + 2] != marker:
             i += 1
             continue
         j = i + 2
         while j + 5 <= len(data):
-            if data[j] == 0x11 and data[j + 1] == 0x08:
+            if data[j : j + 2] == marker:
                 break
             j += 1
         pkt_end = j if j + 5 <= len(data) else len(data)
@@ -89,7 +106,7 @@ def split_packets(data: bytes) -> list[bytes]:
 
 
 def parse_uponor_packet(raw: bytes) -> dict[str, Any] | None:
-    if len(raw) < 7 or raw[0] != 0x11 or raw[1] != 0x08:
+    if len(raw) < 7:
         return None
     sys_id = int.from_bytes(raw[0:2], "big")
     device_id = int.from_bytes(raw[2:4], "big")

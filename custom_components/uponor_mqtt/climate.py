@@ -4,7 +4,9 @@ This platform creates `climate` entities from devices discovered by the
 `HAUponorBridge`. It listens for dispatcher signals named
 `"uponor_mqtt_update_<DEVICEID>"` and updates entity state accordingly.
 
-Note: To use this platform, add to `configuration.yaml`:
+Note: thermostats are normally created through MQTT discovery by the bridge,
+so this legacy platform is not needed. To use it anyway, add to
+`configuration.yaml`:
 
 climate:
   - platform: uponor_mqtt
@@ -18,14 +20,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
+from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import async_generate_entity_id
-from homeassistant.const import TEMP_CELSIUS
-from homeassistant.components.climate import ClimateEntity, SUPPORT_TARGET_TEMPERATURE
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity import async_generate_entity_id
 from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator,
     CoordinatorEntity,
+    DataUpdateCoordinator,
 )
 
 from .const import DOMAIN
@@ -91,7 +93,7 @@ async def async_setup_platform(
 
 
 class UponorClimate(CoordinatorEntity, ClimateEntity):
-    _attr_supported_features = SUPPORT_TARGET_TEMPERATURE
+    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
 
     def __init__(
         self, bridge: Any, device_id: str, coordinator: DataUpdateCoordinator
@@ -121,7 +123,7 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def temperature_unit(self) -> str:
-        return TEMP_CELSIUS
+        return UnitOfTemperature.CELSIUS
 
     @property
     def target_temperature(self) -> float | None:
@@ -154,9 +156,7 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
         self._unsub_dispatcher = async_dispatcher_connect(
             self.bridge.hass,
             f"{DOMAIN}_update_{self.device_id}",
-            lambda state: self.hass.async_create_task(
-                self.coordinator.async_set_updated_data(state)
-            ),
+            self.coordinator.async_set_updated_data,
         )
 
     async def async_will_remove_from_hass(self) -> None:
@@ -173,6 +173,6 @@ class UponorClimate(CoordinatorEntity, ClimateEntity):
         temp = float(kwargs["temperature"])
         await self.bridge.async_set_temperature(self.device_id, temp)
         # optimistic update in coordinator
-        await self.coordinator.async_set_updated_data(
+        self.coordinator.async_set_updated_data(
             {**(self.coordinator.data or {}), "temperature": temp}
         )

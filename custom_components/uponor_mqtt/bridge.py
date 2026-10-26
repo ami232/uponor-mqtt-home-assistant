@@ -6,33 +6,31 @@ Lightweight bridge that adapts Uponor protocol helpers to HA's MQTT API.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
+from homeassistant.components import mqtt, persistent_notification
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.components import mqtt
-from homeassistant.exceptions import HomeAssistantError, ConfigEntryNotReady
-from homeassistant.components import persistent_notification
 from homeassistant.util import dt as dt_util
-import types
-import asyncio as _asyncio
 
-try:
-    import paho.mqtt.client as paho
-except Exception:
-    paho = None
-
+from .const import (
+    DEFAULT_READ_TOPIC,
+    DEFAULT_WRITE_TOPIC,
+    DOMAIN,
+    HA_DISCOVERY_PREFIX,
+)
 from .uponor_protocol import (
-    parse_uponor_packet,
-    parse_state,
-    split_packets,
-    uponor_delta_to_c,
     build_command_packet,
     build_time_command_packet,
+    parse_state,
+    parse_uponor_packet,
+    split_packets,
+    uponor_delta_to_c,
 )
-
-from .const import HA_DISCOVERY_PREFIX, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,16 +38,20 @@ _LOGGER = logging.getLogger(__name__)
 class HAUponorBridge:
     """Home Assistant wrapper for Uponor MQTT bridge functionality.
 
-    If `manual_mqtt` is supplied (a dict with host/port/username/password),
-    the bridge will create its own paho MQTT client and use it directly.
-    Otherwise it uses Home Assistant's `mqtt` helper functions.
+    Raw bus bytes arrive on `read_topic` and command packets are published to
+    `write_topic`, both through Home Assistant's `mqtt` integration. The
+    controller's system ID is taken from `system_id` or learned from the first
+    valid packet seen on the bus.
     """
 
     def __init__(
         self,
         hass: HomeAssistant,
-        manual_mqtt: dict | None = None,
+        *,
+        read_topic: str = DEFAULT_READ_TOPIC,
+        write_topic: str = DEFAULT_WRITE_TOPIC,
         discovery_prefix: str | None = None,
+        system_id: int | None = None,
     ) -> None:
         self.hass = hass
         self._time_device_id: str | None = None
@@ -59,123 +61,82 @@ class HAUponorBridge:
         # device caches
         self.discovered_devices: set[str] = set()
         self.device_state_cache: dict[str, dict[str, Any]] = {}
-        # manual mqtt support
-        self._manual_mqtt = manual_mqtt is not None
-        self._manual_config = manual_mqtt or {}
-        self._paho_client = None
+        self._read_topic = read_topic or DEFAULT_READ_TOPIC
+        self._write_topic = write_topic or DEFAULT_WRITE_TOPIC
         # per-instance discovery prefix (do not mutate imported module constant)
         self._discovery_prefix = discovery_prefix or HA_DISCOVERY_PREFIX
+        self._system_id = system_id
+        self._warned_sys_ids: set[int] = set()
+        self._unsubscribers: list[Callable[[], None]] = []
 
     async def async_start(self) -> None:
         """Start subscriptions and background tasks."""
-        _LOGGER.debug("Starting Uponor bridge (manual=%s)", self._manual_mqtt)
-        if self._manual_mqtt and paho is not None:
-            # Create and start a paho client in background thread
-            client_id = "uponor_translator"
-            self._paho_client = paho.Client(client_id=client_id)
-            if self._manual_config.get("username"):
-                self._paho_client.username_pw_set(
-                    self._manual_config.get("username"),
-                    self._manual_config.get("password"),
-                )
-
-            # Wire callbacks for paho client
-            def _on_connect(client, userdata, flags, rc):
-                _LOGGER.info("Manual MQTT client connected (rc=%s)", rc)
-                # subscribe to topics on connect
-                client.subscribe(
-                    [
-                        ("uponor_read", 0),
-                        (f"{self._discovery_prefix}/climate/+/temperature/set", 0),
-                    ]
-                )
-
-            def _on_message(client, userdata, msg):
-                # Schedule coroutine handling in HA loop
-                ns = types.SimpleNamespace(payload=msg.payload, topic=msg.topic)
-                loop = self.hass.loop
-                loop.call_soon_threadsafe(
-                    _asyncio.create_task, self._dispatch_msg_from_thread(ns)
-                )
-
-            self._paho_client.on_connect = _on_connect
-            self._paho_client.on_message = _on_message
-
-            host = self._manual_config.get("host", "127.0.0.1")
-            port = int(self._manual_config.get("port", 1883))
-            try:
-                self._paho_client.connect_async(host, port)
-                self._paho_client.loop_start()
-                _LOGGER.info(
-                    "Manual paho MQTT client started and connecting to %s:%s",
-                    host,
-                    port,
-                )
-            except Exception as exc:
-                _LOGGER.exception("Failed to connect manual MQTT client: %s", exc)
-        else:
-            # Subscribe to incoming Uponor packets using HA MQTT helper
-            try:
-                # Do not force MQTT payload decoding so callbacks receive raw bytes
+        _LOGGER.debug(
+            "Starting Uponor bridge (read=%s, write=%s, system_id=%s)",
+            self._read_topic,
+            self._write_topic,
+            f"0x{self._system_id:04X}" if self._system_id is not None else "auto",
+        )
+        temp_cmd = f"{self._discovery_prefix}/climate/+/temperature/set"
+        try:
+            # Do not force MQTT payload decoding so callbacks receive raw bytes
+            self._unsubscribers.append(
                 await mqtt.async_subscribe(
-                    self.hass, "uponor_read", self._on_message_reader, encoding=None
+                    self.hass, self._read_topic, self._on_message_reader, encoding=None
                 )
-                temp_cmd = f"{self._discovery_prefix}/climate/+/temperature/set"
+            )
+            self._unsubscribers.append(
                 await mqtt.async_subscribe(self.hass, temp_cmd, self._on_message_writer)
-                _LOGGER.info(
-                    "Subscribed to MQTT topics: 'uponor_read' and '%s'", temp_cmd
+            )
+            _LOGGER.info(
+                "Subscribed to MQTT topics: '%s' and '%s'", self._read_topic, temp_cmd
+            )
+        except HomeAssistantError as exc:
+            _LOGGER.warning(
+                "Failed to subscribe to MQTT topics (MQTT not ready): %s", exc
+            )
+            try:
+                persistent_notification.async_create(
+                    self.hass,
+                    (
+                        "Uponor MQTT Bridge could not subscribe to MQTT topics. "
+                        "Ensure the MQTT integration is configured and connected."
+                    ),
+                    "Uponor MQTT Bridge: MQTT subscription failed",
                 )
-            except HomeAssistantError as exc:
-                _LOGGER.warning(
-                    "Failed to subscribe to MQTT topics (MQTT not ready): %s", exc
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to create persistent notification for MQTT subscribe failure"
                 )
-                try:
-                    persistent_notification.async_create(
-                        self.hass,
-                        (
-                            "Uponor MQTT Bridge could not subscribe to MQTT topics. "
-                            "Ensure the MQTT integration is configured and connected, or "
-                            "enable Manual MQTT mode in the Uponor integration options."
-                        ),
-                        "Uponor MQTT Bridge: MQTT subscription failed",
-                    )
-                except Exception:
-                    _LOGGER.debug(
-                        "Failed to create persistent notification for MQTT subscribe failure"
-                    )
-                # Defer setup so Home Assistant will retry later
-                raise ConfigEntryNotReady("MQTT integration not ready") from exc
+            self._unsubscribe_all()
+            # Defer setup so Home Assistant will retry later
+            raise ConfigEntryNotReady("MQTT integration not ready") from exc
 
         # Start time sync background task
         loop = asyncio.get_running_loop()
         self._time_task = loop.create_task(self._time_sync_loop())
         _LOGGER.info("Uponor bridge started and subscribed to MQTT topics")
 
-    async def _dispatch_msg_from_thread(self, ns: types.SimpleNamespace) -> None:
-        """Helper scheduled from paho thread to dispatch incoming messages."""
-        _LOGGER.debug(
-            "Dispatching manual MQTT message from thread: topic=%s payload_len=%s",
-            ns.topic,
-            len(ns.payload) if ns.payload is not None else 0,
-        )
-        # determine handler by topic
-        if ns.topic == "uponor_read":
-            await self._on_message_reader(ns)
-        elif ns.topic.endswith("/temperature/set") and ns.topic.startswith(
-            f"{self._discovery_prefix}/climate/"
-        ):
-            await self._on_message_writer(ns)
-        else:
-            _LOGGER.debug("Ignoring manual mqtt message on: %s", ns.topic)
+    def _unsubscribe_all(self) -> None:
+        while self._unsubscribers:
+            unsub = self._unsubscribers.pop()
+            try:
+                unsub()
+            except Exception:
+                _LOGGER.debug("Failed to unsubscribe MQTT topic")
 
     async def async_stop(self) -> None:
         """Stop background tasks and clean up."""
+        self._unsubscribe_all()
         if self._time_task:
+            self._time_task.cancel()
             try:
-                self._time_task.cancel()
-                await asyncio.sleep(0)
+                await self._time_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
-                _LOGGER.debug("Failed to cancel time task")
+                _LOGGER.debug("Time sync task ended with an error", exc_info=True)
+            self._time_task = None
         # keep caches for now; nothing else to clean up
 
     async def _publish(
@@ -183,32 +144,27 @@ class HAUponorBridge:
     ) -> None:
         """Helper to publish via Home Assistant MQTT."""
         try:
-            if self._manual_mqtt and self._paho_client is not None:
-                # paho publish is synchronous; run in executor
-                await self.hass.async_add_executor_job(
-                    self._paho_client.publish, topic, payload, qos, retain
-                )
-            else:
-                await mqtt.async_publish(
-                    self.hass, topic, payload, qos=qos, retain=retain
-                )
+            await mqtt.async_publish(self.hass, topic, payload, qos=qos, retain=retain)
         except Exception as exc:
             _LOGGER.exception("Failed to publish %s: %s", topic, exc)
 
     async def _on_message_reader(self, msg) -> None:  # callback from mqtt
-        """Handle incoming `uponor_read` MQTT messages."""
+        """Handle incoming raw bus packets from the read topic."""
         payload: bytes = msg.payload
         try:
             plen = len(payload)
         except Exception:
             plen = 0
         _LOGGER.debug(
-            "Received uponor_read message (len=%s) topic=%s",
+            "Received bus message (len=%s) topic=%s",
             plen,
-            getattr(msg, "topic", "uponor_read"),
+            getattr(msg, "topic", self._read_topic),
         )
 
         packets = split_packets(payload)
+        if not packets and self._system_id is not None:
+            # buffer may start mid-frame; resync on the known system ID
+            packets = split_packets(payload, self._system_id)
         if not packets:
             _LOGGER.debug("No valid UPONOR packets in payload")
             return
@@ -222,6 +178,18 @@ class HAUponorBridge:
             sys_id = packet["sys_id"]
             device_id = packet["device_id"]
             device_id_str = f"{device_id:04X}"
+
+            if self._system_id is None:
+                self._system_id = sys_id
+                _LOGGER.info("Detected Uponor system ID 0x%04X", sys_id)
+            elif sys_id != self._system_id and sys_id not in self._warned_sys_ids:
+                self._warned_sys_ids.add(sys_id)
+                _LOGGER.warning(
+                    "Received packet from system ID 0x%04X, expected 0x%04X; "
+                    "check the System ID setting if this is unexpected",
+                    sys_id,
+                    self._system_id,
+                )
 
             # Ensure cache exists
             if device_id_str not in self.device_state_cache:
@@ -352,37 +320,7 @@ class HAUponorBridge:
             )
             return
 
-        device_state = self.device_state_cache.get(dev_id.upper())
-        if device_state:
-            sys_id = device_state["sys_id"]
-            is_cooling = device_state["is_cooling"]
-            heating_cooling_offset = device_state["heating_cooling_offset"]
-            if is_cooling:
-                temp_to_send = temp_from_ha - heating_cooling_offset
-            else:
-                temp_to_send = temp_from_ha
-        else:
-            _LOGGER.warning("[%s] Device not in cache, using defaults", dev_id)
-            sys_id = 0x1108
-            temp_to_send = temp_from_ha
-
-        # Build command packet and publish to uponor_write (raw bytes)
-        try:
-            buffer = build_command_packet(sys_id, dev_id.lower(), temp_to_send)
-            # Bus writes must not be retained, or the gateway replays them on reconnect
-            await self._publish("uponor_write", buffer, retain=False)
-            _LOGGER.info(
-                "[%s] Set temperature: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
-                dev_id,
-                temp_from_ha,
-                temp_to_send,
-                sys_id,
-            )
-            # Echo back
-            base_topic = f"{self._discovery_prefix}/climate/uponor_{dev_id}"
-            await self._publish(f"{base_topic}/temperature", str(temp_from_ha))
-        except Exception as exc:
-            _LOGGER.exception("Failed to build/send command for %s: %s", dev_id, exc)
+        await self.async_set_temperature(dev_id, temp_from_ha)
 
     async def async_set_temperature(self, device_id: str, temperature: float) -> None:
         """Set temperature for device via the Uponor bus.
@@ -403,16 +341,28 @@ class HAUponorBridge:
                 temp_to_send = temperature - heating_cooling_offset
             else:
                 temp_to_send = temperature
-        else:
-            _LOGGER.warning("[%s] Device not in cache, using defaults", device_id)
-            sys_id = 0x1108
+        elif self._system_id is not None:
+            _LOGGER.warning(
+                "[%s] Device not in cache, using system ID 0x%04X",
+                device_id,
+                self._system_id,
+            )
+            sys_id = self._system_id
             temp_to_send = temperature
+        else:
+            _LOGGER.error(
+                "[%s] Cannot set temperature: Uponor system ID not known yet. "
+                "Wait for bus traffic or set the System ID in the integration options",
+                device_id,
+            )
+            return
 
         try:
             buffer = build_command_packet(sys_id, device_id.lower(), temp_to_send)
-            await self._publish("uponor_write", buffer, retain=False)
+            # Bus writes must not be retained, or the gateway replays them on reconnect
+            await self._publish(self._write_topic, buffer, retain=False)
             _LOGGER.info(
-                "[%s] Set temperature via API: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
+                "[%s] Set temperature: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
                 device_id,
                 temperature,
                 temp_to_send,
@@ -454,8 +404,6 @@ class HAUponorBridge:
             "payload_not_available": "offline",
         }
         # Return JSON string for MQTT discovery
-        import json
-
         return json.dumps(config)
 
     async def _send_time_if_ready(self) -> None:
@@ -472,7 +420,7 @@ class HAUponorBridge:
             # Use HA's configured time zone, not the container's
             now = dt_util.now()
             buf = build_time_command_packet(sys_id, dev_id.lower(), now)
-            await self._publish("uponor_write", buf, retain=False)
+            await self._publish(self._write_topic, buf, retain=False)
             self._last_time_sync = asyncio.get_event_loop().time()
             self._last_time_sync_offset = now.utcoffset()
             _LOGGER.info("[%s] Sent time synchronization (%s)", dev_id, now.isoformat())
