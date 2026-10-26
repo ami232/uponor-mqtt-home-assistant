@@ -66,16 +66,33 @@ def crc16_modbus(data: bytes) -> int:
     return crc & 0xFFFF
 
 
-def split_packets(data: bytes) -> list[bytes]:
+def _is_valid_frame(pkt: bytes) -> bool:
+    # header (4) + payload (1 request byte or N 3-byte fields) + CRC (2)
+    if len(pkt) != 7 and (len(pkt) < 9 or (len(pkt) - 6) % 3 != 0):
+        return False
+    return crc16_modbus(pkt[:-2]) == int.from_bytes(pkt[-2:], "little")
+
+
+def split_packets(data: bytes, sys_id: int | None = None) -> list[bytes]:
+    """Split a raw bus buffer into CRC-valid packets.
+
+    Every frame starts with the 2-byte system ID of the controller. If
+    `sys_id` is not known yet, the first two bytes of the buffer are used.
+    """
+    if len(data) < 7:
+        return []
+    if _is_valid_frame(data):
+        return [data]
+    marker = sys_id.to_bytes(2, "big") if sys_id is not None else data[0:2]
     packets = []
     i = 0
     while i + 7 <= len(data):
-        if data[i] != 0x11 or data[i + 1] != 0x08:
+        if data[i : i + 2] != marker:
             i += 1
             continue
         j = i + 2
         while j + 5 <= len(data):
-            if data[j] == 0x11 and data[j + 1] == 0x08:
+            if data[j : j + 2] == marker:
                 break
             j += 1
         pkt_end = j if j + 5 <= len(data) else len(data)
@@ -89,7 +106,7 @@ def split_packets(data: bytes) -> list[bytes]:
 
 
 def parse_uponor_packet(raw: bytes) -> dict[str, Any] | None:
-    if len(raw) < 7 or raw[0] != 0x11 or raw[1] != 0x08:
+    if len(raw) < 7:
         return None
     sys_id = int.from_bytes(raw[0:2], "big")
     device_id = int.from_bytes(raw[2:4], "big")
@@ -120,86 +137,118 @@ def parse_uponor_packet(raw: bytes) -> dict[str, Any] | None:
     return result
 
 
-def parse_state(packet: dict[str, Any]) -> dict[str, Any]:
-    state = {}
-    is_cooling = False
-    heating_cooling_offset_raw = packet.get("heating_cooling_offset", 0x24)
-    heating_cooling_offset = (
-        uponor_delta_to_c(heating_cooling_offset_raw)
-        if heating_cooling_offset_raw is not None
-        else 0.0
-    )
+class UponorThermostat:
+    """Accumulated state of one thermostat.
 
-    mode2 = packet.get("mode2")
-    if mode2 is not None:
-        is_cooling = bool(mode2 & 0x1000)
+    A thermostat's fields arrive spread over several frames, and the setpoint
+    on the bus does not include the offsets the thermostat applies itself, so
+    the displayed setpoint can only be worked out from the latest value of
+    every field. Mirrors ESPHome's `uponor_smatrix` climate component, plus
+    the heating/cooling offset from esphome/esphome#11129.
+    """
 
-    d = packet.get("action")
-    if d is not None:
-        if d & 0x0040:
-            state["action"] = "cooling" if (d & 0x1000) else "heating"
-        else:
-            state["action"] = "idle"
+    def __init__(self) -> None:
+        self.target_raw: int | None = None
+        self.eco_setback_raw = 0x0048
+        self.heating_cooling_offset_raw = 0x0024
+        self.cooling = False
+        self.eco = False
+        self.demand: int | None = None
+        self.current_temperature: float | None = None
+        self.external_temperature: float | None = None
+        self.current_humidity: int | None = None
+        self.min_temp: float | None = None
+        self.max_temp: float | None = None
 
-    h = packet.get("current_humidity")
-    if h is not None:
-        state["current_humidity"] = h & 0xFF
+    def update(self, packet: dict[str, Any]) -> None:
+        """Apply the fields of a packet from `parse_uponor_packet`."""
 
-    rt = packet.get("current_temperature")
-    if rt is not None and rt != UPONOR_INVALID_VALUE:
-        state["current_temperature"] = uponor_to_temp(rt)
+        def valid(field: str) -> int | None:
+            value = packet.get(field)
+            return None if value == UPONOR_INVALID_VALUE else value
 
-    t = packet.get("temperature")
-    if t is not None:
-        base_temp = uponor_to_temp(t, round_to_half=True)
-        if is_cooling:
-            state["temperature"] = base_temp + heating_cooling_offset
-        else:
-            state["temperature"] = base_temp
+        if (v := packet.get("heating_cooling_offset")) is not None:
+            self.heating_cooling_offset_raw = v
+        if (v := valid("temperature_low")) is not None:
+            self.min_temp = uponor_to_temp(v, round_to_half=True)
+        if (v := valid("temperature_high")) is not None:
+            self.max_temp = uponor_to_temp(v, round_to_half=True)
+        # 0x7FFF is the controller asking the thermostat for its setpoint
+        if (v := valid("temperature")) is not None:
+            self.target_raw = v
+        if (v := valid("eco_setback")) is not None:
+            self.eco_setback_raw = v
+        if (v := packet.get("action")) is not None:
+            self.demand = v
+            self.cooling = bool(v & 0x1000)
+        if (v := packet.get("mode2")) is not None:
+            self.cooling = bool(v & 0x1000)
+        if (v := packet.get("preset_mode")) is not None:
+            self.eco = bool(v & 0x0008)
+        if "current_temperature" in packet:
+            v = valid("current_temperature")
+            self.current_temperature = None if v is None else uponor_to_temp(v)
+        if "external_temperature" in packet:
+            v = valid("external_temperature")
+            self.external_temperature = None if v is None else uponor_to_temp(v)
+        if (v := packet.get("current_humidity")) is not None:
+            self.current_humidity = v & 0xFF
 
-    m1 = packet.get("preset_mode")
-    if m1 is not None:
-        state["preset_mode"] = "eco" if (m1 & 0x0008) else None
+    def _offset_raw(self) -> int:
+        """Offset the thermostat adds to the bus setpoint in the current mode."""
+        if self.cooling:
+            offset = self.heating_cooling_offset_raw
+            return offset + self.eco_setback_raw if self.eco else offset
+        return -self.eco_setback_raw if self.eco else 0
 
-    if mode2 is not None:
-        if is_cooling:
-            state["mode"] = "cool"
-        else:
-            state["mode"] = "heat"
+    @property
+    def target_temperature(self) -> float | None:
+        """Setpoint as shown on the thermostat."""
+        if self.target_raw is None:
+            return None
+        return uponor_to_temp(self.target_raw + self._offset_raw(), round_to_half=True)
 
-    ext_temp = packet.get("external_temperature")
-    if ext_temp is not None and ext_temp != UPONOR_INVALID_VALUE:
-        state["external_temperature"] = uponor_to_temp(ext_temp)
+    def setpoint_raw(self, temperature: float) -> int:
+        """Bus value that makes the thermostat show `temperature`."""
+        return temp_to_uponor(temperature) - self._offset_raw()
 
-    temp_low = packet.get("temperature_low")
-    if temp_low is not None and temp_low != UPONOR_INVALID_VALUE:
-        state["temperature_low"] = uponor_to_temp(temp_low)
-
-    temp_high = packet.get("temperature_high")
-    if temp_high is not None and temp_high != UPONOR_INVALID_VALUE:
-        state["temperature_high"] = uponor_to_temp(temp_high)
-
-    eco = packet.get("eco_setback")
-    if eco is not None and eco != UPONOR_INVALID_VALUE:
-        state["eco_setback"] = uponor_delta_to_c(eco)
-
-    outdoor = packet.get("outdoor_temperature")
-    if outdoor is not None and outdoor != UPONOR_INVALID_VALUE:
-        state["outdoor_temperature"] = uponor_to_temp(outdoor)
-
-    return state
+    def state(self) -> dict[str, Any]:
+        """Home Assistant state; fields not seen yet are left out."""
+        state: dict[str, Any] = {
+            "mode": "cool" if self.cooling else "heat",
+            "preset_mode": "eco" if self.eco else "none",
+        }
+        if self.demand is not None:
+            if self.demand & 0x0040:
+                state["action"] = "cooling" if self.cooling else "heating"
+            else:
+                state["action"] = "idle"
+        values = {
+            "temperature": self.target_temperature,
+            "current_temperature": self.current_temperature,
+            "external_temperature": self.external_temperature,
+            "current_humidity": self.current_humidity,
+            "min_temp": self.min_temp,
+            "max_temp": self.max_temp,
+        }
+        state.update({k: v for k, v in values.items() if v is not None})
+        return state
 
 
 def build_command_packet(
     sys_id: int, dev_id: str, temp: float, unit: str = "C"
 ) -> bytes:
+    return build_setpoint_packet(sys_id, dev_id, temp_to_uponor(temp=temp, unit=unit))
+
+
+def build_setpoint_packet(sys_id: int, dev_id: str, raw: int) -> bytes:
+    """Build a setpoint command from a raw bus value (tenths of °F)."""
     try:
         dev_id_int = int(dev_id, 16)
     except ValueError as exc:
         raise ValueError(f"Invalid device id '{dev_id}': {exc}") from None
 
-    tmp_val = temp_to_uponor(temp=temp, unit=unit)
-
+    # The thermostat only reacts if a null setpoint is sent first
     payload = struct.pack(
         ">HHBHBH",
         sys_id,
@@ -207,7 +256,7 @@ def build_command_packet(
         UponorFields.TEMPERATURE,
         0,
         UponorFields.TEMPERATURE,
-        tmp_val,
+        raw,
     )
     crc = crc16_modbus(payload)
     return payload + struct.pack("<H", crc)

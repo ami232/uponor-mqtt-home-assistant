@@ -1,20 +1,32 @@
 """Uponor MQTT Bridge integration for Home Assistant.
 
-This integration subscribes to `uponor_read` and listens for Home Assistant
-temperature set commands, then publishes `uponor_write` byte payloads using
-the Home Assistant MQTT helper.
-
-Place this directory under `custom_components/uponor_mqtt` and restart Home
-Assistant. The integration requires the `mqtt` integration to be set up.
+This integration reads raw Uponor Smatrix bus packets from an MQTT topic
+(published by an RS485-to-MQTT gateway), exposes the thermostats as climate
+entities via MQTT discovery, and publishes temperature commands back to the
+bus through a second MQTT topic. It requires the `mqtt` integration to be set
+up.
 """
 
 from __future__ import annotations
 
 import logging
-from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from homeassistant.components import mqtt
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+
 from .bridge import HAUponorBridge
+from .const import (
+    CONF_DISCOVERY_PREFIX,
+    CONF_READ_TOPIC,
+    CONF_SYSTEM_ID,
+    CONF_WRITE_TOPIC,
+    DEFAULT_READ_TOPIC,
+    DEFAULT_WRITE_TOPIC,
+    DOMAIN,
+    HA_DISCOVERY_PREFIX,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,53 +34,54 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Uponor MQTT Bridge integration.
 
-    This integration does not need any YAML config; it hooks into the existing
-    broker configured by the `mqtt` integration. On setup it starts the bridge
-    which subscribes to `uponor_read` and the HA temperature set topic.
+    This integration does not need any YAML config; the bridge is started from
+    the config entry.
     """
-    _LOGGER.info("Setting up Uponor MQTT Bridge integration")
-
     # keep minimal setup; real start occurs in config entries
     hass.data.setdefault(DOMAIN, {})
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up integration from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    # If the user provided manual MQTT settings in the config entry, pass them
-    # to the bridge so it can create its own paho MQTT client. Otherwise the
-    # bridge will use Home Assistant's `mqtt` helper.
-    manual = entry.data.get("manual_mqtt")
-    discovery_prefix = entry.data.get("discovery_prefix")
-    bridge = HAUponorBridge(hass, manual_mqtt=manual, discovery_prefix=discovery_prefix)
-    _LOGGER.info(
-        "Setting up Uponor entry %s (manual_mqtt=%s, discovery_prefix=%s)",
-        entry.entry_id,
-        bool(manual),
-        discovery_prefix,
+
+    if not await mqtt.async_wait_for_mqtt_client(hass):
+        raise ConfigEntryNotReady("MQTT integration is not available")
+
+    if entry.data.get("manual_mqtt"):
+        _LOGGER.warning(
+            "Manual MQTT broker mode was removed in 1.1.0; the Home Assistant "
+            "MQTT integration is used instead"
+        )
+
+    # Options override the values entered during initial setup
+    config = {**entry.data, **entry.options}
+    bridge = HAUponorBridge(
+        hass,
+        read_topic=config.get(CONF_READ_TOPIC) or DEFAULT_READ_TOPIC,
+        write_topic=config.get(CONF_WRITE_TOPIC) or DEFAULT_WRITE_TOPIC,
+        discovery_prefix=config.get(CONF_DISCOVERY_PREFIX) or HA_DISCOVERY_PREFIX,
+        system_id=config.get(CONF_SYSTEM_ID),
     )
+    _LOGGER.info("Setting up Uponor entry %s", entry.entry_id)
     await bridge.async_start()
     hass.data[DOMAIN]["bridge"] = bridge
     hass.data[DOMAIN]["entry_id"] = entry.entry_id
+
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry so new topics / system ID take effect."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
     if bridge is not None:
-        # stop background tasks if supported
-        stop = getattr(bridge, "async_stop", None)
-        if stop is not None:
-            await stop()
-        # if bridge created a manual paho client, stop it
-        p = getattr(bridge, "_paho_client", None)
-        if p is not None:
-            try:
-                p.loop_stop()
-                p.disconnect()
-            except Exception:
-                _LOGGER.debug("Failed to stop manual MQTT client")
+        await bridge.async_stop()
     hass.data.pop(DOMAIN, None)
     return True
