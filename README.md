@@ -157,6 +157,11 @@ For protocol research, turn on **Capture raw bus traffic** under **Configure**. 
 - Only target temperature can be set. Mode (heat/cool) and the ECO preset are read-only.
 - Temperatures are in °C.
 
+## Upgrading to 1.3.0
+
+- **Virtual thermostat (experimental).** Home Assistant can act as a thermostat for a channel that has none. See [Virtual thermostat](#virtual-thermostat-experimental). It's off unless you configure it, and it needs the gateway's TCP socket.
+- **New options and actions.** A raw bus capture option for troubleshooting, and the `capture_note` and `measure_latency` actions. Nothing changes for existing setups.
+
 ## Upgrading to 1.2.0
 
 - **New sensors.** Each thermostat gets room temperature, external temperature, humidity and target temperature sensors.
