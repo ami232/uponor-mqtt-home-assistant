@@ -30,49 +30,13 @@ The integration never talks to the bus directly. It needs a gateway that:
 1. publishes the **raw bytes** it receives from the RS485 bus to an MQTT topic, and
 2. writes the raw bytes it receives on another MQTT topic to the bus.
 
-Any gateway that does this works. The setup below uses the Elfin EW41B.
+Any gateway that does this works. If you use other topic names than the defaults, enter them when you set up the integration.
 
-## Hardware: Elfin EW41B (reference setup)
+## Gateway setup
 
-The [Elfin EW41B](http://www.hi-flying.com/) is a small RS485-to-Wi-Fi converter with a built-in MQTT client.
+- **Elfin EW41B** (reference setup): see [docs/elfin-ew41b.md](docs/elfin-ew41b.md) for wiring, serial and MQTT settings, and how to secure the gateway.
 
-### Wiring
-
-Connect the EW41B's RS485 **A/B** terminals to the bus terminals on the Uponor Smatrix controller (A to A, B to B). Power the EW41B from its supported supply range (see its datasheet). If the gateway receives nothing, swap A and B.
-
-### Serial settings
-
-Open the EW41B web UI. Out of the box it runs its own Wi-Fi access point at `10.10.100.254`, with the login `admin` / `admin`. Once it's on your network, use the IP your router gives it. Under **Serial Port Settings**:
-
-| Setting | Value |
-| --- | --- |
-| Baud rate | 19200 |
-| Data bits / parity / stop bits | 8 / None / 1 |
-| Flow control | Half duplex (RS485 direction control) |
-| Buffer size | 256 |
-| Gap time | 10 ms |
-| Protocol | None (transparent) |
-
-### MQTT settings
-
-Under **Communication Settings**, add a socket with protocol **MQTT** that points at the same broker Home Assistant uses:
-
-| Setting | Value |
-| --- | --- |
-| Server / port | your broker (e.g. the Mosquitto add-on, port 1883) |
-| MQTT version | 3.1 (the default; 3.1.1 also works with Mosquitto) |
-| Client ID | any unique name (e.g. `Elfin`) |
-| Username / password | an MQTT user on the broker |
-| Publish topic / QoS | `uponor_read` / 0 |
-| Subscribe topic / QoS | `uponor_write` / 0 |
-| Route | `uart` |
-| Connect mode | Always |
-
-The 10 ms gap time makes the EW41B publish each bus frame as soon as the line goes quiet, so most MQTT messages contain a single frame. The integration also copes with several frames in one message, because it finds frame boundaries using the CRC.
-
-Change the default `admin` password on the web UI. The page shows the MQTT password in plain text.
-
-If you use other topic names, enter them when you set up the integration.
+Whatever gateway you use, give it its own MQTT user and keep it off networks it doesn't need. Anyone who can reach it, or publish to the write topic, can send raw bytes to your heating bus.
 
 ## Installation
 
@@ -144,7 +108,7 @@ Each thermostat also gets these sensors, created once it reports the value:
   mosquitto_sub -h <broker> -u <user> -P <pass> -t uponor_read -F %x
   ```
   You should see hex frames that all start with the same two bytes (your system ID).
-- If nothing arrives, check the wiring (try swapping A/B), the serial settings and the gateway's MQTT settings.
+- If nothing arrives, check the wiring (try swapping A/B), the serial settings and the gateway's MQTT settings (see [the gateway guide](docs/elfin-ew41b.md)).
 - Frames that fail the CRC check are dropped. A lot of them usually means a wrong baud rate.
 
 **Temperature changes do nothing**
