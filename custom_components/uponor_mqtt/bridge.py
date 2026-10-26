@@ -24,15 +24,23 @@ from .const import (
     HA_DISCOVERY_PREFIX,
 )
 from .uponor_protocol import (
-    build_command_packet,
+    UponorThermostat,
+    build_setpoint_packet,
     build_time_command_packet,
-    parse_state,
     parse_uponor_packet,
     split_packets,
-    uponor_delta_to_c,
+    temp_to_uponor,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# State field -> (entity name, device class, unit) for the per-thermostat sensors
+SENSORS: dict[str, tuple[str, str, str]] = {
+    "current_temperature": ("Temperature", "temperature", "°C"),
+    "external_temperature": ("External temperature", "temperature", "°C"),
+    "current_humidity": ("Humidity", "humidity", "%"),
+    "temperature": ("Target temperature", "temperature", "°C"),
+}
 
 
 class HAUponorBridge:
@@ -61,6 +69,9 @@ class HAUponorBridge:
         # device caches
         self.discovered_devices: set[str] = set()
         self.device_state_cache: dict[str, dict[str, Any]] = {}
+        self._thermostats: dict[str, UponorThermostat] = {}
+        self._published: dict[str, dict[str, Any]] = {}
+        self._discovery_configs: dict[str, str] = {}
         self._read_topic = read_topic or DEFAULT_READ_TOPIC
         self._write_topic = write_topic or DEFAULT_WRITE_TOPIC
         # per-instance discovery prefix (do not mutate imported module constant)
@@ -78,6 +89,8 @@ class HAUponorBridge:
             f"0x{self._system_id:04X}" if self._system_id is not None else "auto",
         )
         temp_cmd = f"{self._discovery_prefix}/climate/+/temperature/set"
+        mode_cmd = f"{self._discovery_prefix}/climate/+/mode/set"
+        preset_cmd = f"{self._discovery_prefix}/climate/+/preset_mode/set"
         try:
             # Do not force MQTT payload decoding so callbacks receive raw bytes
             self._unsubscribers.append(
@@ -88,6 +101,12 @@ class HAUponorBridge:
             self._unsubscribers.append(
                 await mqtt.async_subscribe(self.hass, temp_cmd, self._on_message_writer)
             )
+            for topic in (mode_cmd, preset_cmd):
+                self._unsubscribers.append(
+                    await mqtt.async_subscribe(
+                        self.hass, topic, self._on_read_only_command
+                    )
+                )
             _LOGGER.info(
                 "Subscribed to MQTT topics: '%s' and '%s'", self._read_topic, temp_cmd
             )
@@ -148,6 +167,9 @@ class HAUponorBridge:
         except Exception as exc:
             _LOGGER.exception("Failed to publish %s: %s", topic, exc)
 
+    def _base_topic(self, device_id_str: str) -> str:
+        return f"{self._discovery_prefix}/climate/uponor_{device_id_str}"
+
     async def _on_message_reader(self, msg) -> None:  # callback from mqtt
         """Handle incoming raw bus packets from the read topic."""
         payload: bytes = msg.payload
@@ -174,132 +196,113 @@ class HAUponorBridge:
             if not packet:
                 _LOGGER.debug("Failed to parse uponor packet: %s", raw_pkt.hex())
                 continue
+            await self._handle_packet(packet)
 
-            sys_id = packet["sys_id"]
-            device_id = packet["device_id"]
-            device_id_str = f"{device_id:04X}"
+    async def _handle_packet(self, packet: dict[str, Any]) -> None:
+        sys_id = packet["sys_id"]
+        device_id = packet["device_id"]
+        device_id_str = f"{device_id:04X}"
 
-            if self._system_id is None:
-                self._system_id = sys_id
-                _LOGGER.info("Detected Uponor system ID 0x%04X", sys_id)
-            elif sys_id != self._system_id and sys_id not in self._warned_sys_ids:
-                self._warned_sys_ids.add(sys_id)
-                _LOGGER.warning(
-                    "Received packet from system ID 0x%04X, expected 0x%04X; "
-                    "check the System ID setting if this is unexpected",
-                    sys_id,
-                    self._system_id,
-                )
+        if self._system_id is None:
+            self._system_id = sys_id
+            _LOGGER.info("Detected Uponor system ID 0x%04X", sys_id)
+        elif sys_id != self._system_id and sys_id not in self._warned_sys_ids:
+            self._warned_sys_ids.add(sys_id)
+            _LOGGER.warning(
+                "Received packet from system ID 0x%04X, expected 0x%04X; "
+                "check the System ID setting if this is unexpected",
+                sys_id,
+                self._system_id,
+            )
 
-            # Ensure cache exists
-            if device_id_str not in self.device_state_cache:
-                self.device_state_cache[device_id_str] = {
-                    "sys_id": sys_id,
-                    "is_cooling": False,
-                    "heating_cooling_offset": 2.0,
-                }
-            else:
-                self.device_state_cache[device_id_str]["sys_id"] = sys_id
+        if packet.get("special_ff"):
+            # Controller polling a device; carries no data
+            return
 
-            # Update cooling flag and offset if present
-            mode2 = packet.get("mode2")
-            if mode2 is not None:
-                is_cooling = bool(mode2 & 0x1000)
-                self.device_state_cache[device_id_str]["is_cooling"] = is_cooling
+        thermostat = self._thermostats.setdefault(device_id_str, UponorThermostat())
+        thermostat.update(packet)
+        ha_state = thermostat.state()
+        self.device_state_cache[device_id_str] = {"sys_id": sys_id, **ha_state}
 
-            heating_cooling_offset_raw = packet.get("heating_cooling_offset")
-            if heating_cooling_offset_raw is not None:
-                heating_cooling_offset = uponor_delta_to_c(heating_cooling_offset_raw)
-                self.device_state_cache[device_id_str][
-                    "heating_cooling_offset"
-                ] = heating_cooling_offset
-
-            ha_state = parse_state(packet)
-
-            # Adjust temperature using cached offset if needed
-            if "temperature" in ha_state and "mode" not in ha_state:
-                cached = self.device_state_cache.get(device_id_str)
-                if cached and cached.get("is_cooling"):
-                    offset = float(cached.get("heating_cooling_offset", 2.0))
-                    ha_state["temperature"] = round(ha_state["temperature"] + offset, 1)
-
-            unique_id = f"uponor_{device_id_str}"
-            base_topic = f"{self._discovery_prefix}/climate/{unique_id}"
-
-            # Publish availability and state fields
-            await self._publish(f"{base_topic}/availability", "online")
-            for k, v in ha_state.items():
-                try:
-                    await self._publish(f"{base_topic}/{k}", v)
-                except Exception:
-                    _LOGGER.exception(
-                        "Failed publishing state field %s for %s", k, device_id_str
-                    )
-
-            # store sys_id for writes
-            await self._publish(f"{base_topic}/sys_id", sys_id)
-
-            # Publish discovery config if not already
-            if device_id_str not in self.discovered_devices:
-                try:
-                    cfg = self._build_discovery_config(device_id, sys_id)
-                    await self._publish(
-                        f"{self._discovery_prefix}/climate/{unique_id}/config", cfg
-                    )
-                    _LOGGER.info("Published discovery config for %s", device_id_str)
-                except Exception:
-                    _LOGGER.exception(
-                        "Failed to publish discovery config for %s", device_id_str
-                    )
-                self.discovered_devices.add(device_id_str)
-                # notify listeners that a new device appeared
-                try:
-                    async_dispatcher_send(
-                        self.hass, f"{DOMAIN}_device_new", device_id_str
-                    )
-                except Exception:
-                    _LOGGER.debug(
-                        "Failed to send new-device dispatcher for %s", device_id_str
-                    )
-
-            _LOGGER.info("Published state for %s: %s", device_id_str, ha_state)
-
-            # Notify any local entities about the update
+        # Only thermostats report a room temperature; other bus devices
+        # (e.g. the controller itself) do not get entities
+        if device_id_str not in self.discovered_devices:
+            if "current_temperature" not in packet:
+                return
+            _LOGGER.info("Found thermostat at address 0x%04X%04X", sys_id, device_id)
+            self.discovered_devices.add(device_id_str)
+            # notify listeners that a new device appeared
             try:
-                async_dispatcher_send(
-                    self.hass, f"{DOMAIN}_update_{device_id_str}", ha_state
-                )
+                async_dispatcher_send(self.hass, f"{DOMAIN}_device_new", device_id_str)
             except Exception:
-                _LOGGER.exception(
-                    "Failed to send dispatcher update for %s", device_id_str
+                _LOGGER.debug(
+                    "Failed to send new-device dispatcher for %s", device_id_str
                 )
 
-            # Detect time master
-            if (
-                self._time_device_id is None
-                and "datetime1" in packet
-                and "current_temperature" in packet
-            ):
-                self._time_device_id = device_id_str
-                _LOGGER.info(
-                    "Detected time master thermostat at device 0x%s (sys_id=0x%04X)",
-                    device_id_str,
-                    sys_id,
-                )
-                await self._send_time_if_ready()
+        await self._publish_discovery(device_id_str, sys_id, thermostat)
+
+        base_topic = self._base_topic(device_id_str)
+        published = self._published.setdefault(device_id_str, {})
+        if not published:
+            await self._publish(f"{base_topic}/availability", "online")
+        changed = {k: v for k, v in ha_state.items() if published.get(k) != v}
+        for k, v in changed.items():
+            await self._publish(f"{base_topic}/{k}", v)
+            published[k] = v
+        if changed:
+            _LOGGER.debug("Published state for %s: %s", device_id_str, changed)
+
+        # Notify any local entities about the update
+        try:
+            async_dispatcher_send(
+                self.hass,
+                f"{DOMAIN}_update_{device_id_str}",
+                self.device_state_cache[device_id_str],
+            )
+        except Exception:
+            _LOGGER.exception("Failed to send dispatcher update for %s", device_id_str)
+
+        # Detect time master
+        if (
+            self._time_device_id is None
+            and "datetime1" in packet
+            and "current_temperature" in packet
+        ):
+            self._time_device_id = device_id_str
+            _LOGGER.info(
+                "Detected time master thermostat at device 0x%s (sys_id=0x%04X)",
+                device_id_str,
+                sys_id,
+            )
+            await self._send_time_if_ready()
+
+    async def _publish_discovery(
+        self, device_id_str: str, sys_id: int, thermostat: UponorThermostat
+    ) -> None:
+        """Publish discovery configs that are new or changed (e.g. min/max)."""
+        configs = {
+            f"{self._discovery_prefix}/climate/uponor_{device_id_str}/config": (
+                self._build_discovery_config(int(device_id_str, 16), sys_id, thermostat)
+            )
+        }
+        state = thermostat.state()
+        for key in SENSORS:
+            if key in state:
+                configs[
+                    f"{self._discovery_prefix}/sensor/uponor_{device_id_str}_{key}/config"
+                ] = self._build_sensor_config(device_id_str, sys_id, key)
+
+        for topic, cfg in configs.items():
+            if self._discovery_configs.get(topic) == cfg:
+                continue
+            await self._publish(topic, cfg)
+            self._discovery_configs[topic] = cfg
+            _LOGGER.info("Published discovery config %s", topic)
 
     async def _on_message_writer(self, msg) -> None:
         """Handle incoming temperature set messages from Home Assistant topics."""
-        try:
-            parts = msg.topic.split("/")
-            if len(parts) < 5 or parts[-2] != "temperature" or parts[-1] != "set":
-                raise ValueError("Unexpected topic structure")
-            unique_id = parts[-3]
-            if not unique_id.startswith("uponor_"):
-                raise ValueError(f"Unexpected unique_id '{unique_id}'")
-            dev_id = unique_id[len("uponor_") :].upper()
-        except ValueError as exc:
-            _LOGGER.error("Unexpected topic format (%s): %s", msg.topic, exc)
+        dev_id = self._device_from_command_topic(msg.topic, "temperature")
+        if dev_id is None:
             return
 
         try:
@@ -322,25 +325,55 @@ class HAUponorBridge:
 
         await self.async_set_temperature(dev_id, temp_from_ha)
 
+    def _device_from_command_topic(self, topic: str, field: str) -> str | None:
+        try:
+            parts = topic.split("/")
+            if len(parts) < 5 or parts[-2] != field or parts[-1] != "set":
+                raise ValueError("Unexpected topic structure")
+            unique_id = parts[-3]
+            if not unique_id.startswith("uponor_"):
+                raise ValueError(f"Unexpected unique_id '{unique_id}'")
+            return unique_id[len("uponor_") :].upper()
+        except ValueError as exc:
+            _LOGGER.error("Unexpected topic format (%s): %s", topic, exc)
+            return None
+
+    async def _on_read_only_command(self, msg) -> None:
+        """Reject mode/preset changes and restore the thermostat's real state.
+
+        Heating/cooling is switched at the controller and ECO by its schedule,
+        so neither can be changed over the bus.
+        """
+        field = msg.topic.split("/")[-2]
+        dev_id = self._device_from_command_topic(msg.topic, field)
+        if dev_id is None:
+            return
+        _LOGGER.warning(
+            "[%s] %s is read-only; change it on the thermostat or controller",
+            dev_id,
+            field,
+        )
+        value = self._published.get(dev_id, {}).get(field)
+        if value is not None:
+            await self._publish(f"{self._base_topic(dev_id)}/{field}", value)
+
     async def async_set_temperature(self, device_id: str, temperature: float) -> None:
         """Set temperature for device via the Uponor bus.
 
         Args:
             device_id: 4-hex uppercase device id string (e.g. '00A1')
-            temperature: temperature in Celsius as float
+            temperature: temperature in Celsius as float, as shown on the
+                thermostat (the bus value is adjusted for cooling/ECO offsets)
         """
+        device_id = device_id.upper()
         _LOGGER.debug(
             "API set temperature request for %s -> %s", device_id, temperature
         )
-        device_state = self.device_state_cache.get(device_id.upper())
-        if device_state:
+        device_state = self.device_state_cache.get(device_id)
+        thermostat = self._thermostats.get(device_id)
+        if device_state and thermostat:
             sys_id = device_state["sys_id"]
-            is_cooling = device_state["is_cooling"]
-            heating_cooling_offset = device_state["heating_cooling_offset"]
-            if is_cooling:
-                temp_to_send = temperature - heating_cooling_offset
-            else:
-                temp_to_send = temperature
+            raw = thermostat.setpoint_raw(temperature)
         elif self._system_id is not None:
             _LOGGER.warning(
                 "[%s] Device not in cache, using system ID 0x%04X",
@@ -348,7 +381,7 @@ class HAUponorBridge:
                 self._system_id,
             )
             sys_id = self._system_id
-            temp_to_send = temperature
+            raw = temp_to_uponor(temperature)
         else:
             _LOGGER.error(
                 "[%s] Cannot set temperature: Uponor system ID not known yet. "
@@ -358,22 +391,36 @@ class HAUponorBridge:
             return
 
         try:
-            buffer = build_command_packet(sys_id, device_id.lower(), temp_to_send)
+            buffer = build_setpoint_packet(sys_id, device_id.lower(), raw)
             # Bus writes must not be retained, or the gateway replays them on reconnect
             await self._publish(self._write_topic, buffer, retain=False)
             _LOGGER.info(
-                "[%s] Set temperature: HA=%.1f°C, bus=%.1f°C (sys_id=0x%04X)",
+                "[%s] Set temperature: HA=%.1f°C, bus raw=%d (sys_id=0x%04X)",
                 device_id,
                 temperature,
-                temp_to_send,
+                raw,
                 sys_id,
             )
-            base_topic = f"{self._discovery_prefix}/climate/uponor_{device_id}"
-            await self._publish(f"{base_topic}/temperature", str(temperature))
+            await self._publish(
+                f"{self._base_topic(device_id)}/temperature", str(temperature)
+            )
+            self._published.setdefault(device_id, {})["temperature"] = temperature
         except Exception as exc:
             _LOGGER.exception("Failed to build/send command for %s: %s", device_id, exc)
 
-    def _build_discovery_config(self, device_id: int, sys_id: int) -> str:
+    def _device_info(self, device_id_str: str, sys_id: int) -> dict[str, Any]:
+        return {
+            "identifiers": [f"uponor_{device_id_str}"],
+            "name": f"Uponor Thermostat {device_id_str}",
+            "manufacturer": "Uponor",
+            "model": "Smatrix thermostat",
+            # Full 32-bit bus address, as used by ESPHome's uponor_smatrix
+            "serial_number": f"{sys_id:04X}{device_id_str}",
+        }
+
+    def _build_discovery_config(
+        self, device_id: int, sys_id: int, thermostat: UponorThermostat
+    ) -> str:
         device_id_str = f"{device_id:04X}"
         unique_id = f"uponor_{device_id_str}"
         base_topic = f"{self._discovery_prefix}/climate/{unique_id}"
@@ -381,29 +428,44 @@ class HAUponorBridge:
             "name": f"Uponor {device_id_str}",
             "unique_id": unique_id,
             "default_entity_id": f"climate.uponor_{device_id_str.lower()}",
-            "device": {
-                "identifiers": [unique_id],
-                "name": f"Uponor Thermostat {device_id_str}",
-                "manufacturer": "Uponor",
-                "model": "Floor Heating Thermostat",
-            },
+            "device": self._device_info(device_id_str, sys_id),
             "temperature_unit": "C",
             "temp_step": 0.5,
             "precision": 0.1,
-            "min_temp": 5,
-            "max_temp": 35,
+            "min_temp": thermostat.min_temp if thermostat.min_temp is not None else 5,
+            "max_temp": thermostat.max_temp if thermostat.max_temp is not None else 35,
             "current_temperature_topic": f"{base_topic}/current_temperature",
             "temperature_state_topic": f"{base_topic}/temperature",
             "action_topic": f"{base_topic}/action",
             "mode_state_topic": f"{base_topic}/mode",
+            "mode_command_topic": f"{base_topic}/mode/set",
             "temperature_command_topic": f"{base_topic}/temperature/set",
             "modes": ["heat", "cool"],
+            "preset_modes": ["eco"],
+            "preset_mode_state_topic": f"{base_topic}/preset_mode",
+            "preset_mode_command_topic": f"{base_topic}/preset_mode/set",
             "current_humidity_topic": f"{base_topic}/current_humidity",
             "availability_topic": f"{base_topic}/availability",
             "payload_available": "online",
             "payload_not_available": "offline",
         }
         # Return JSON string for MQTT discovery
+        return json.dumps(config)
+
+    def _build_sensor_config(self, device_id_str: str, sys_id: int, key: str) -> str:
+        name, device_class, unit = SENSORS[key]
+        base_topic = self._base_topic(device_id_str)
+        config = {
+            "name": name,
+            "unique_id": f"uponor_{device_id_str}_{key}",
+            "default_entity_id": f"sensor.uponor_{device_id_str.lower()}_{key}",
+            "device": self._device_info(device_id_str, sys_id),
+            "state_topic": f"{base_topic}/{key}",
+            "device_class": device_class,
+            "unit_of_measurement": unit,
+            "state_class": "measurement",
+            "availability_topic": f"{base_topic}/availability",
+        }
         return json.dumps(config)
 
     async def _send_time_if_ready(self) -> None:

@@ -96,26 +96,106 @@ def test_request_frame():
     assert parsed["sys_id"] == 0x110B
 
 
-def test_parse_state():
-    pkt = _frame(
-        0x110B,
-        0x00A1,
+def _thermostat(*frames: list[tuple[int, int]]) -> "proto.UponorThermostat":
+    thermostat = proto.UponorThermostat()
+    for fields in frames:
+        thermostat.update(proto.parse_uponor_packet(_frame(0x110B, 0x00A1, fields)))
+    return thermostat
+
+
+F = proto.UponorFields
+
+
+def test_thermostat_state():
+    thermostat = _thermostat(
         [
-            (proto.UponorFields.CURRENT_TEMPERATURE, proto.temp_to_uponor(20.0)),
-            (proto.UponorFields.TEMPERATURE, proto.temp_to_uponor(22.0)),
-            (proto.UponorFields.CURRENT_HUMIDITY, 48),
-            (proto.UponorFields.MODE2, 0x0000),
-            (proto.UponorFields.ACTION, 0x0040),
-        ],
+            (F.CURRENT_TEMPERATURE, proto.temp_to_uponor(20.0)),
+            (F.TEMPERATURE, proto.temp_to_uponor(22.0)),
+            (F.CURRENT_HUMIDITY, 48),
+            (F.MODE2, 0x0000),
+            (F.ACTION, 0x0040),
+        ]
     )
-    state = proto.parse_state(proto.parse_uponor_packet(pkt))
-    assert state == {
+    assert thermostat.state() == {
         "current_temperature": 20.0,
         "temperature": 22.0,
         "current_humidity": 48,
         "mode": "heat",
+        "preset_mode": "none",
         "action": "heating",
     }
+
+
+def test_thermostat_fields_accumulate_across_frames():
+    thermostat = _thermostat(
+        [(F.TEMPERATURE, proto.temp_to_uponor(22.0))],
+        [(F.CURRENT_TEMPERATURE, proto.temp_to_uponor(20.0))],
+        [
+            (F.TEMPERATURE_LOW, proto.temp_to_uponor(10.0)),
+            (F.TEMPERATURE_HIGH, proto.temp_to_uponor(28.0)),
+            (F.EXTERNAL_TEMPERATURE, proto.temp_to_uponor(24.5)),
+        ],
+    )
+    state = thermostat.state()
+    assert state["temperature"] == 22.0
+    assert state["current_temperature"] == 20.0
+    assert state["external_temperature"] == 24.5
+    assert (state["min_temp"], state["max_temp"]) == (10.0, 28.0)
+
+
+def test_setpoint_request_value_ignored():
+    thermostat = _thermostat(
+        [(F.TEMPERATURE, proto.temp_to_uponor(22.0))],
+        [(F.TEMPERATURE, proto.UPONOR_INVALID_VALUE)],
+    )
+    assert thermostat.target_temperature == 22.0
+
+
+def test_invalid_sensor_values_left_out():
+    thermostat = _thermostat(
+        [
+            (F.CURRENT_TEMPERATURE, proto.UPONOR_INVALID_VALUE),
+            (F.EXTERNAL_TEMPERATURE, proto.UPONOR_INVALID_VALUE),
+        ]
+    )
+    state = thermostat.state()
+    assert "current_temperature" not in state
+    assert "external_temperature" not in state
+
+
+# (fields, setpoint shown on the thermostat) for a bus setpoint of 21 °C,
+# a 2 °C heating/cooling offset and a 4 °C ECO setback
+OFFSET_CASES = {
+    "heating": ([(F.MODE2, 0x0000)], 21.0),
+    "heating eco": ([(F.MODE2, 0x0000), (F.PRESET_MODE, 0x0008)], 17.0),
+    "cooling": ([(F.MODE2, 0x1000)], 23.0),
+    "cooling eco": ([(F.MODE2, 0x1000), (F.PRESET_MODE, 0x0008)], 27.0),
+    "cooling from demand": ([(F.ACTION, 0x1040)], 23.0),
+}
+
+
+@pytest.mark.parametrize("case", OFFSET_CASES)
+def test_setpoint_offsets(case):
+    fields, shown = OFFSET_CASES[case]
+    thermostat = _thermostat(
+        [
+            (F.HEATING_COOLING_OFFSET, 36),
+            (F.ECO_SETBACK, 72),
+            (F.TEMPERATURE, proto.temp_to_uponor(21.0)),
+            *fields,
+        ]
+    )
+    assert thermostat.target_temperature == shown
+    # Setting the shown value writes the original bus value back
+    assert thermostat.setpoint_raw(shown) == proto.temp_to_uponor(21.0)
+
+
+def test_cooling_action_and_mode():
+    thermostat = _thermostat([(F.MODE2, 0x1000), (F.ACTION, 0x1040)])
+    assert thermostat.state()["mode"] == "cool"
+    assert thermostat.state()["action"] == "cooling"
+    thermostat = _thermostat([(F.ACTION, 0x0000)])
+    assert thermostat.state()["action"] == "idle"
 
 
 @pytest.mark.parametrize("celsius", [5.0, 18.5, 21.0, 35.0])

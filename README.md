@@ -1,8 +1,19 @@
 # Uponor MQTT Bridge – Home Assistant custom integration
 
-Connects Uponor Smatrix floor-heating thermostats to Home Assistant through MQTT. Each thermostat shows up as a `climate` entity, with its current temperature, target temperature, humidity, heating/cooling mode and action. Target temperatures set in Home Assistant are sent back to the thermostats.
+Connects Uponor Smatrix floor-heating thermostats to Home Assistant through MQTT. Each thermostat shows up as a `climate` entity, with its current temperature, target temperature, humidity, heating/cooling mode, ECO preset and action, plus separate sensors for its readings. Target temperatures set in Home Assistant are sent back to the thermostats.
 
 The integration also keeps the thermostat clock in sync with Home Assistant's time zone, including DST changes.
+
+### ESPHome or this integration?
+
+[ESPHome's `uponor_smatrix` component](https://esphome.io/components/uponor_smatrix/) does the same job on an ESP32/ESP8266 wired to the bus. This integration follows the same protocol handling and offers the same entities. It's meant for people who already have, or prefer, an off-the-shelf RS485-to-MQTT gateway and don't want to flash an ESP.
+
+| | ESPHome `uponor_smatrix` | This integration |
+| --- | --- | --- |
+| Hardware | ESP + RS485-to-TTL converter | Any transparent RS485-to-MQTT gateway |
+| Thermostats | Addresses listed in YAML | Discovered automatically |
+| Cooling | Mode and action only; setpoint is off by the heating/cooling offset while cooling ([esphome#10924](https://github.com/esphome/esphome/issues/10924)) | Mode, action and correct setpoint |
+| ECO preset, min/max setpoint, clock sync | Yes | Yes |
 
 ## How it works
 
@@ -106,7 +117,23 @@ Until the ID is known, temperature changes for thermostats that haven't sent any
 
 ## Entities
 
-Each thermostat seen on the bus gets a climate entity named `climate.uponor_<device id>` (for example `climate.uponor_00a1`). It's created through MQTT discovery under `<discovery prefix>/climate/uponor_<ID>/…`. A thermostat appears once it has sent its first frame on the bus.
+Each thermostat gets a device with a climate entity named `climate.uponor_<device id>` (for example `climate.uponor_00a1`). They're created through MQTT discovery under `<discovery prefix>/climate/uponor_<ID>/…`. A thermostat appears once it reports its room temperature on the bus. Other bus devices, such as the controller itself, get no entities. The device's serial number is the full 32-bit bus address (system ID + device ID, e.g. `110BDE13`), the same address ESPHome uses.
+
+The climate entity shows:
+
+- **Target temperature** as displayed on the thermostat. While cooling, the thermostat adds the controller's heating/cooling offset to the setpoint it reports on the bus. In ECO it subtracts the ECO setback when heating and adds it when cooling. The integration applies the same offsets, so Home Assistant and the thermostat agree. Setting a temperature reverses them.
+- **Mode** (`heat` / `cool`) and **ECO preset**, both read-only. Heating/cooling is switched at the controller and ECO by its schedule. If you change them in Home Assistant, the change is logged and reverted.
+- **Action** (heating, cooling or idle), **current temperature** and **humidity**.
+- **Min/max setpoint**, taken from the thermostat's limits.
+
+Each thermostat also gets these sensors, created once it reports the value:
+
+| Sensor | Entity |
+| --- | --- |
+| Room temperature | `sensor.uponor_<id>_current_temperature` |
+| External (floor/outdoor) temperature | `sensor.uponor_<id>_external_temperature` |
+| Humidity | `sensor.uponor_<id>_current_humidity` |
+| Target temperature | `sensor.uponor_<id>_temperature` |
 
 ## Troubleshooting
 
@@ -136,7 +163,7 @@ logger:
 ## Limitations
 
 - One Uponor controller (one system ID) per Home Assistant instance.
-- Only target temperature can be set. Mode (heat/cool) and eco presets are read-only.
+- Only target temperature can be set. Mode (heat/cool) and the ECO preset are read-only.
 - Temperatures are in °C.
 
 ## Upgrading from 1.0.x
