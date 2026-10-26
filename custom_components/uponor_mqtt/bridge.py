@@ -108,7 +108,7 @@ class HAUponorBridge:
         self._last_rx = 0.0
         self._last_registration_broadcast = 0.0
         self._probe: tuple[str, asyncio.Future[float]] | None = None
-        self.virtual: VirtualThermostat | None = None
+        self.virtuals: dict[str, VirtualThermostat] = {}
 
     @property
     def system_id(self) -> int | None:
@@ -371,14 +371,10 @@ class HAUponorBridge:
             # Controller polling a device; carries no data
             return
 
-        if (
-            self.virtual is not None
-            and device_id_str == self.virtual.device_id
-            and not packet.get("virtual")
-        ):
+        if (virtual := self.virtuals.get(device_id_str)) and not packet.get("virtual"):
             # The controller's frame to our virtual thermostat. It echoes the
             # setpoint it last heard from us, which may lag a change made here.
-            self.virtual.on_controller_packet(packet)
+            virtual.on_controller_packet(packet)
             packet = {k: v for k, v in packet.items() if k != "temperature"}
 
         thermostat = self._thermostats.setdefault(device_id_str, UponorThermostat())
@@ -535,9 +531,9 @@ class HAUponorBridge:
         _LOGGER.debug(
             "API set temperature request for %s -> %s", device_id, temperature
         )
-        if self.virtual is not None and device_id == self.virtual.device_id:
+        if virtual := self.virtuals.get(device_id):
             # Our own thermostat: it announces the new setpoint in its replies
-            self.virtual.set_target(temperature)
+            virtual.set_target(temperature)
             await self._publish(
                 f"{self._base_topic(device_id)}/temperature", str(temperature)
             )

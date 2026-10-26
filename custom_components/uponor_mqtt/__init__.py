@@ -27,14 +27,15 @@ from .bridge import HAUponorBridge
 from .const import (
     CAPTURE_FILE,
     CONF_CAPTURE,
+    CONF_DEVICE_ID,
     CONF_DISCOVERY_PREFIX,
+    CONF_HUMIDITY_ENTITY,
     CONF_READ_TOPIC,
     CONF_SYSTEM_ID,
-    CONF_VIRTUAL_DEVICE_ID,
+    CONF_TEMPERATURE_ENTITY,
     CONF_VIRTUAL_HOST,
-    CONF_VIRTUAL_HUMIDITY,
     CONF_VIRTUAL_PORT,
-    CONF_VIRTUAL_TEMPERATURE,
+    CONF_VIRTUAL_THERMOSTATS,
     CONF_WRITE_TOPIC,
     DEFAULT_READ_TOPIC,
     DEFAULT_VIRTUAL_PORT,
@@ -42,16 +43,25 @@ from .const import (
     DOMAIN,
     HA_DISCOVERY_PREFIX,
 )
-from .virtual import VirtualThermostat
+from .virtual import REGISTRATION_WINDOW, GatewayConnection, VirtualThermostat
 
 _LOGGER = logging.getLogger(__name__)
 
 SERVICE_CAPTURE_NOTE = "capture_note"
 CAPTURE_NOTE_SCHEMA = vol.Schema({vol.Required("text"): cv.string})
+DEVICE_ID_FIELD = vol.Match(r"^[0-9A-Fa-f]{4}$")
+VIRTUAL_SCHEMA = vol.Schema({vol.Optional("device_id"): DEVICE_ID_FIELD})
+REGISTER_SCHEMA = VIRTUAL_SCHEMA.extend(
+    {
+        vol.Optional("seconds", default=REGISTRATION_WINDOW): vol.All(
+            vol.Coerce(int), vol.Range(min=10, max=600)
+        )
+    }
+)
 SERVICE_MEASURE_LATENCY = "measure_latency"
 MEASURE_LATENCY_SCHEMA = vol.Schema(
     {
-        vol.Required("device_id"): vol.Match(r"^[0-9A-Fa-f]{4}$"),
+        vol.Required("device_id"): DEVICE_ID_FIELD,
         vol.Optional("count", default=20): vol.All(int, vol.Range(min=1, max=50)),
     }
 )
@@ -86,29 +96,45 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             call.data["device_id"], call.data["count"]
         )
 
-    def _virtual() -> VirtualThermostat:
+    def _virtuals(call: ServiceCall, *, single: bool) -> list[VirtualThermostat]:
+        """Virtual thermostats an action applies to: the given one, or all."""
         bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
-        if bridge is None or bridge.virtual is None:
+        virtuals = bridge.virtuals if bridge else {}
+        if not virtuals:
             raise ServiceValidationError(
-                "No virtual thermostat; configure one in the integration options"
+                "No virtual thermostat; add one in the integration options"
             )
-        return bridge.virtual
+        if device_id := call.data.get("device_id"):
+            if (virtual := virtuals.get(device_id.upper())) is None:
+                raise ServiceValidationError(f"No virtual thermostat {device_id.upper()}")
+            return [virtual]
+        if single and len(virtuals) > 1:
+            raise ServiceValidationError(
+                "Several virtual thermostats; give the device_id to register"
+            )
+        return list(virtuals.values())
 
     async def _register_virtual(call: ServiceCall) -> None:
-        _virtual().open_registration()
+        (target,) = _virtuals(call, single=True)
+        # Only one thermostat may answer the controller's registration broadcast
+        for virtual in hass.data[DOMAIN]["bridge"].virtuals.values():
+            virtual.close_registration()
+        target.open_registration(call.data["seconds"])
 
     async def _start_virtual(call: ServiceCall) -> None:
-        _virtual().set_answering(True)
+        for virtual in _virtuals(call, single=False):
+            virtual.set_answering(True)
 
     async def _stop_virtual(call: ServiceCall) -> None:
-        _virtual().set_answering(False)
+        for virtual in _virtuals(call, single=False):
+            virtual.set_answering(False)
 
-    for name, handler in (
-        ("register_virtual_thermostat", _register_virtual),
-        ("start_virtual_thermostat", _start_virtual),
-        ("stop_virtual_thermostat", _stop_virtual),
+    for name, handler, schema in (
+        ("register_virtual_thermostat", _register_virtual, REGISTER_SCHEMA),
+        ("start_virtual_thermostat", _start_virtual, VIRTUAL_SCHEMA),
+        ("stop_virtual_thermostat", _stop_virtual, VIRTUAL_SCHEMA),
     ):
-        hass.services.async_register(DOMAIN, name, handler)
+        hass.services.async_register(DOMAIN, name, handler, schema=schema)
 
     hass.services.async_register(
         DOMAIN,
@@ -149,25 +175,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await bridge.async_start()
     hass.data[DOMAIN]["bridge"] = bridge
 
-    if all(
-        config.get(key)
-        for key in (CONF_VIRTUAL_HOST, CONF_VIRTUAL_DEVICE_ID, CONF_VIRTUAL_TEMPERATURE)
-    ):
-        bridge.virtual = VirtualThermostat(
+    connection: GatewayConnection | None = None
+    if config.get(CONF_VIRTUAL_HOST) and config.get(CONF_VIRTUAL_THERMOSTATS):
+        connection = GatewayConnection(
             hass,
             bridge,
-            host=config[CONF_VIRTUAL_HOST],
-            port=config.get(CONF_VIRTUAL_PORT) or DEFAULT_VIRTUAL_PORT,
-            device_id=config[CONF_VIRTUAL_DEVICE_ID],
-            temperature_entity=config[CONF_VIRTUAL_TEMPERATURE],
-            humidity_entity=config.get(CONF_VIRTUAL_HUMIDITY),
+            config[CONF_VIRTUAL_HOST],
+            config.get(CONF_VIRTUAL_PORT) or DEFAULT_VIRTUAL_PORT,
         )
-        await bridge.virtual.async_start()
+        for item in config[CONF_VIRTUAL_THERMOSTATS]:
+            virtual = VirtualThermostat(
+                hass,
+                bridge,
+                connection,
+                device_id=item[CONF_DEVICE_ID],
+                temperature_entity=item[CONF_TEMPERATURE_ENTITY],
+                humidity_entity=item.get(CONF_HUMIDITY_ENTITY),
+            )
+            connection.virtuals.append(virtual)
+            bridge.virtuals[virtual.device_id] = virtual
+        await connection.async_start()
         _LOGGER.warning(
-            "Experimental virtual thermostat %s enabled (gateway TCP %s)",
-            bridge.virtual.device_id,
+            "Experimental virtual thermostats %s enabled (gateway TCP %s)",
+            ", ".join(bridge.virtuals),
             config[CONF_VIRTUAL_HOST],
         )
+    hass.data[DOMAIN]["connection"] = connection
     hass.data[DOMAIN]["entry_id"] = entry.entry_id
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
@@ -182,9 +215,10 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     bridge: HAUponorBridge | None = hass.data.get(DOMAIN, {}).get("bridge")
+    connection: GatewayConnection | None = hass.data.get(DOMAIN, {}).get("connection")
+    if connection is not None:
+        await connection.async_stop()
     if bridge is not None:
-        if bridge.virtual is not None:
-            await bridge.virtual.async_stop()
         await bridge.async_stop()
     hass.data.pop(DOMAIN, None)
     return True

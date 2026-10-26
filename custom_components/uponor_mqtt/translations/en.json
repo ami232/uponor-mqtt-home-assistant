@@ -26,24 +26,47 @@
         "step": {
             "init": {
                 "title": "Uponor MQTT Bridge options",
-                "description": "Changing these settings reloads the integration.",
+                "menu_options": {
+                    "settings": "Bus and gateway settings",
+                    "add_virtual": "Add a virtual thermostat (experimental)",
+                    "remove_virtual": "Remove a virtual thermostat"
+                }
+            },
+            "settings": {
+                "title": "Bus and gateway settings",
+                "description": "Changing these settings reloads the integration. The gateway TCP socket is only needed for virtual thermostats.",
                 "data": {
                     "read_topic": "Read topic (gateway publishes bus bytes here)",
                     "write_topic": "Write topic (gateway sends these bytes to the bus)",
                     "discovery_prefix": "MQTT discovery prefix",
                     "system_id": "System ID (hex, e.g. 110B; blank = auto-detect)",
                     "capture": "Capture raw bus traffic to uponor_capture.jsonl (debug)",
-                    "virtual_tcp_host": "Virtual thermostat (experimental): gateway TCP host",
-                    "virtual_tcp_port": "Virtual thermostat: gateway TCP port",
-                    "virtual_device_id": "Virtual thermostat: bus device ID (4 hex digits, unused)",
-                    "virtual_temperature_entity": "Virtual thermostat: room temperature sensor",
-                    "virtual_humidity_entity": "Virtual thermostat: humidity sensor (optional)"
+                    "virtual_tcp_host": "Gateway TCP host (for virtual thermostats)",
+                    "virtual_tcp_port": "Gateway TCP port"
+                }
+            },
+            "add_virtual": {
+                "title": "Add a virtual thermostat",
+                "description": "Home Assistant answers the controller as this thermostat, reporting the sensor's temperature. Use a device ID that no real thermostat has. After adding it, register it on a channel with the uponor_mqtt.register_virtual_thermostat action.",
+                "data": {
+                    "device_id": "Bus device ID (4 hex digits)",
+                    "temperature_entity": "Room temperature sensor",
+                    "humidity_entity": "Humidity sensor (optional)"
+                }
+            },
+            "remove_virtual": {
+                "title": "Remove virtual thermostats",
+                "description": "Also unregister their channels on the controller, or it keeps polling a thermostat that no longer answers.",
+                "data": {
+                    "device_id": "Virtual thermostats to remove"
                 }
             }
         },
         "error": {
             "invalid_system_id": "System ID must be a hexadecimal value between 0000 and FFFF.",
-            "invalid_device_id": "Device ID must be 4 hex digits, not 0000 or FFFF."
+            "invalid_device_id": "Device ID must be 4 hex digits, not 0000 or FFFF.",
+            "device_id_in_use": "This device ID is already used by a thermostat on the bus.",
+            "no_gateway_tcp": "Set the gateway TCP host under Bus and gateway settings first."
         }
     }
 }

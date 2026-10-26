@@ -16,7 +16,9 @@ CAPTURE_FILE = "uponor_capture.jsonl"
 # Experimental virtual thermostat
 CONF_VIRTUAL_HOST = "virtual_tcp_host"
 CONF_VIRTUAL_PORT = "virtual_tcp_port"
-CONF_VIRTUAL_DEVICE_ID = "virtual_device_id"
-CONF_VIRTUAL_TEMPERATURE = "virtual_temperature_entity"
-CONF_VIRTUAL_HUMIDITY = "virtual_humidity_entity"
+CONF_VIRTUAL_THERMOSTATS = "virtual_thermostats"
+# Keys of each entry in CONF_VIRTUAL_THERMOSTATS
+CONF_DEVICE_ID = "device_id"
+CONF_TEMPERATURE_ENTITY = "temperature_entity"
+CONF_HUMIDITY_ENTITY = "humidity_entity"
 DEFAULT_VIRTUAL_PORT = 8899

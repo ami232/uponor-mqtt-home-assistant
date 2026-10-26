@@ -110,15 +110,17 @@ It has been tested on a Smatrix Base Pulse X-245 with T-148 thermostats and an E
 ### Setup
 
 1. On the gateway, add a **Tcp Server** socket on port 8899 with route **Uart**. The gateway guide has [the details and the security trade-off](docs/elfin-ew41b.md#raw-tcp-socket-for-the-virtual-thermostat).
-2. Under **Configure**, fill in the virtual thermostat fields:
-   - the gateway's IP address and TCP port
-   - an **unused** 4-digit hex device ID, e.g. `42F0`; check it isn't one of your thermostats
+2. Under **Configure → Bus and gateway settings**, enter the gateway's IP address and TCP port.
+3. Under **Configure → Add a virtual thermostat**, choose:
+   - an **unused** 4-digit hex device ID (one is suggested, e.g. `42F0`)
    - the room temperature sensor, and optionally a humidity sensor
-3. Register it like a real thermostat. On the controller, hold **OK** until a channel LED flashes red, move to the channel with **< / >** and press **OK** (the LED flashes green). Within a minute, run the action `uponor_mqtt.register_virtual_thermostat`. The channel LED turns steady green when registration succeeds. Hold **OK** to leave registration mode.
+
+   Repeat for each room. All virtual thermostats share one connection to the gateway.
+4. Register it like a real thermostat. Run the action `uponor_mqtt.register_virtual_thermostat` with its `device_id`; `seconds` sets how long it waits, 60 by default. While it waits, go to the controller: hold **OK** until a channel LED flashes red, move to the channel with **< / >** and press **OK** (the LED flashes green). The channel LED turns steady green when registration succeeds. Hold **OK** to leave registration mode.
 
 The virtual thermostat then appears as `climate.uponor_<device id>`, like the real ones. Its setpoint is stored in Home Assistant and survives restarts.
 
-**If Home Assistant stops answering**, during a restart or with `uponor_mqtt.stop_virtual_thermostat`, the controller treats the thermostat as lost. As with a real thermostat, it doesn't close the channel; it runs its heating fallback until the virtual thermostat answers again. `uponor_mqtt.start_virtual_thermostat` resumes answering. To remove it, unregister the channel on the controller and clear the fields under **Configure**.
+**If Home Assistant stops answering**, during a restart or with `uponor_mqtt.stop_virtual_thermostat`, the controller treats the thermostat as lost. As with a real thermostat, it doesn't close the channel; it runs its heating fallback until the virtual thermostat answers again. `uponor_mqtt.start_virtual_thermostat` resumes answering. To remove one, unregister its channel on the controller and use **Configure → Remove a virtual thermostat**.
 
 **Measuring latency.** `uponor_mqtt.measure_latency` times poll → reply round trips to a real thermostat through MQTT. It transmits on the bus, but only the controller's own poll and only while the bus is idle.
 

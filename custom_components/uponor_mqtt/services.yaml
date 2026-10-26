@@ -38,16 +38,46 @@ measure_latency:
 register_virtual_thermostat:
   name: Register virtual thermostat
   description: >-
-    Experimental. For the next 60 s, answer the controller's registration
-    broadcast as the virtual thermostat. Arm the channel on the controller
-    first (hold OK, pick the channel, press OK).
+    Experimental. Answer the controller's registration broadcast as a virtual
+    thermostat. Arm the channel on the controller (hold OK, pick the channel,
+    press OK) while the window is open.
+  fields:
+    device_id:
+      name: Device ID
+      description: Virtual thermostat to register. Needed when there are several.
+      example: "42F0"
+      selector:
+        text:
+    seconds:
+      name: Window
+      description: How long to wait for the registration broadcast.
+      default: 60
+      selector:
+        number:
+          min: 10
+          max: 600
+          unit_of_measurement: s
 
 start_virtual_thermostat:
   name: Start virtual thermostat
   description: Experimental. Resume answering the controller's polls.
+  fields:
+    device_id:
+      name: Device ID
+      description: Virtual thermostat to start. All when left empty.
+      example: "42F0"
+      selector:
+        text:
 
 stop_virtual_thermostat:
   name: Stop virtual thermostat
   description: >-
     Experimental. Stop answering the controller's polls, as if the thermostat
     had failed. The controller then runs its fallback on that channel.
+  fields:
+    device_id:
+      name: Device ID
+      description: Virtual thermostat to stop. All when left empty.
+      example: "42F0"
+      selector:
+        text:

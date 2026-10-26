@@ -62,52 +62,30 @@ REGISTRATION_MAX_ANSWERS = 25
 REGISTRATION_FRAME_GAP = 0.003
 
 
-class VirtualThermostat:
-    """Answer the controller's polls for one device ID over the gateway's TCP socket."""
+class GatewayConnection:
+    """The gateway's raw TCP socket, shared by all virtual thermostats.
+
+    The gateway serves the bus to TCP clients as a byte stream. Every chunk
+    received is handed to each virtual thermostat, which writes its reply
+    straight away.
+    """
 
     def __init__(
-        self,
-        hass: HomeAssistant,
-        bridge: HAUponorBridge,
-        *,
-        host: str,
-        port: int,
-        device_id: str,
-        temperature_entity: str,
-        humidity_entity: str | None = None,
+        self, hass: HomeAssistant, bridge: HAUponorBridge, host: str, port: int
     ) -> None:
         self.hass = hass
         self._bridge = bridge
         self._host = host
         self._port = port
-        self.device_id = device_id.upper()
-        self._temperature_entity = temperature_entity
-        self._humidity_entity = humidity_entity
-        self.target = DEFAULT_TARGET
-        self._announce = SETPOINT_ANNOUNCEMENTS
-        self._cooling = False
-        self._answering = True
-        self._register_until = 0.0
-        self._register_answers = 0
+        self.virtuals: list[VirtualThermostat] = []
         self._writer: asyncio.StreamWriter | None = None
         self._task: asyncio.Task | None = None
-        self._poll: bytes | None = None
-        self._reply: bytes | None = None
-        self.replies = 0
-        self._store: Store[dict[str, Any]] = Store(
-            hass, STORAGE_VERSION, f"{DOMAIN}.virtual_{self.device_id.lower()}"
-        )
-
-    @property
-    def answering(self) -> bool:
-        return self._answering
 
     async def async_start(self) -> None:
-        # The thermostat owns the setpoint, so keep it across restarts
-        if (stored := await self._store.async_load()) and "target" in stored:
-            self.target = stored["target"]
+        for virtual in self.virtuals:
+            await virtual.async_load()
         self._task = self.hass.async_create_background_task(
-            self._run(), f"uponor_mqtt virtual thermostat {self.device_id}"
+            self._run(), "uponor_mqtt gateway TCP connection"
         )
 
     async def async_stop(self) -> None:
@@ -120,6 +98,86 @@ class VirtualThermostat:
             self._task = None
         self._close()
 
+    def send(self, data: bytes, what: str) -> None:
+        if self._writer is None:
+            return
+        self._writer.write(data)
+        self._bridge.capture("tx", data, via="tcp", what=what)
+
+    async def _run(self) -> None:
+        warned = False
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection(self._host, self._port)
+                sock = writer.get_extra_info("socket")
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._writer = writer
+                warned = False
+                _LOGGER.info("Connected to gateway TCP %s:%s", self._host, self._port)
+                while data := await reader.read(512):
+                    for virtual in self.virtuals:
+                        virtual.on_bus_data(data)
+                raise ConnectionError("gateway closed the connection")
+            except (OSError, ConnectionError) as exc:
+                if not warned:
+                    _LOGGER.warning(
+                        "Gateway TCP %s:%s unavailable (%s); retrying",
+                        self._host,
+                        self._port,
+                        exc,
+                    )
+                    warned = True
+                self._close()
+                await asyncio.sleep(RECONNECT_DELAY)
+
+    def _close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+
+
+class VirtualThermostat:
+    """Answer the controller's polls for one device ID."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        bridge: HAUponorBridge,
+        connection: GatewayConnection,
+        *,
+        device_id: str,
+        temperature_entity: str,
+        humidity_entity: str | None = None,
+    ) -> None:
+        self.hass = hass
+        self._bridge = bridge
+        self._connection = connection
+        self.device_id = device_id.upper()
+        self._temperature_entity = temperature_entity
+        self._humidity_entity = humidity_entity
+        self.target = DEFAULT_TARGET
+        self._announce = SETPOINT_ANNOUNCEMENTS
+        self._cooling = False
+        self._answering = True
+        self._register_until = 0.0
+        self._register_answers = 0
+        self._poll: bytes | None = None
+        self._reply: bytes | None = None
+        self.replies = 0
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.virtual_{self.device_id.lower()}"
+        )
+
+    @property
+    def answering(self) -> bool:
+        return self._answering
+
+    async def async_load(self) -> None:
+        # The thermostat owns the setpoint, so keep it across restarts
+        if (stored := await self._store.async_load()) and "target" in stored:
+            self.target = stored["target"]
+
     def set_answering(self, answering: bool) -> None:
         """Pause or resume replies, e.g. to see how the controller copes."""
         self._answering = answering
@@ -129,15 +187,18 @@ class VirtualThermostat:
             "resumed" if answering else "stopped",
         )
 
-    def open_registration(self) -> None:
-        """Answer registration broadcasts for the next minute."""
-        self._register_until = time.monotonic() + REGISTRATION_WINDOW
+    def open_registration(self, seconds: float = REGISTRATION_WINDOW) -> None:
+        """Answer registration broadcasts for the next `seconds`."""
+        self._register_until = time.monotonic() + seconds
         self._register_answers = 0
         _LOGGER.warning(
             "Virtual thermostat %s will register on the next broadcast (%d s)",
             self.device_id,
-            REGISTRATION_WINDOW,
+            seconds,
         )
+
+    def close_registration(self) -> None:
+        self._register_until = 0.0
 
     def set_target(self, temperature: float) -> None:
         self.target = temperature
@@ -201,50 +262,7 @@ class VirtualThermostat:
 
     # Bus
 
-    async def _run(self) -> None:
-        warned = False
-        while True:
-            try:
-                reader, writer = await asyncio.open_connection(self._host, self._port)
-                sock = writer.get_extra_info("socket")
-                if sock is not None:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self._writer = writer
-                warned = False
-                _LOGGER.info(
-                    "Virtual thermostat %s connected to %s:%s",
-                    self.device_id,
-                    self._host,
-                    self._port,
-                )
-                while data := await reader.read(512):
-                    self._on_bus_data(data)
-                raise ConnectionError("gateway closed the connection")
-            except (OSError, ConnectionError) as exc:
-                if not warned:
-                    _LOGGER.warning(
-                        "Virtual thermostat %s: gateway TCP %s:%s unavailable (%s); retrying",
-                        self.device_id,
-                        self._host,
-                        self._port,
-                        exc,
-                    )
-                    warned = True
-                self._close()
-                await asyncio.sleep(RECONNECT_DELAY)
-
-    def _close(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
-
-    def _send(self, data: bytes, what: str) -> None:
-        if self._writer is None:
-            return
-        self._writer.write(data)
-        self._bridge.capture("tx", data, via="tcp", what=what)
-
-    def _on_bus_data(self, data: bytes) -> None:
+    def on_bus_data(self, data: bytes) -> None:
         """Handle raw bus bytes; replies are written before anything else runs."""
         sys_id = self._bridge.system_id
         if sys_id is None:
@@ -257,10 +275,10 @@ class VirtualThermostat:
             loop = asyncio.get_running_loop()
             for i, frame in enumerate(build_registration_packets(sys_id, self.device_id)):
                 if i == 0:
-                    self._send(frame, what="register")
+                    self._connection.send(frame, "register")
                 else:
                     loop.call_later(
-                        i * REGISTRATION_FRAME_GAP, self._send, frame, "register"
+                        i * REGISTRATION_FRAME_GAP, self._connection.send, frame, "register"
                     )
             _LOGGER.warning(
                 "Virtual thermostat %s answered registration broadcast %d",
@@ -274,7 +292,7 @@ class VirtualThermostat:
             return
         if self._reply is None:
             self._reply = self._build_reply(sys_id)
-        self._send(self._reply, "reply")
+        self._connection.send(self._reply, "reply")
         self.replies += 1
         if self._announce > 0:
             self._announce -= 1
