@@ -12,6 +12,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
+          # Brand assets are only needed for the default HACS store
+          ignore: brands
 
   hassfest:
     runs-on: ubuntu-latest
