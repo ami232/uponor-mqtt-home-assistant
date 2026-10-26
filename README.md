@@ -21,7 +21,7 @@ The integration also keeps the thermostat clock in sync with Home Assistant's ti
 Uponor Smatrix controller ──RS485 bus──► RS485-to-Wi-Fi gateway ──MQTT──► Home Assistant
    (thermostats on the bus)               (e.g. Elfin EW41B)                (this integration)
 
-  bus bytes  ──► read topic  (default: uponor_read)  ──► parsed → climate entities (MQTT discovery)
+  bus bytes  ──► read topic  (default: uponor_read)  ──► parsed → climate entities + sensors (MQTT discovery)
   bus bytes  ◄── write topic (default: uponor_write) ◄── target temperature / clock sync
 ```
 
@@ -129,6 +129,12 @@ logger:
 - One Uponor controller (one system ID) per Home Assistant instance.
 - Only target temperature can be set. Mode (heat/cool) and the ECO preset are read-only.
 - Temperatures are in °C.
+
+## Upgrading to 1.2.0
+
+- **New sensors.** Each thermostat gets room temperature, external temperature, humidity and target temperature sensors.
+- **Mode and ECO are read-only.** Changes made in Home Assistant used to look like they worked. Now they're logged and reverted.
+- **Only thermostats get entities.** Devices that never report a room temperature, such as the controller, no longer get a climate entity. If an older version created one, its discovery message is still retained on the broker and the entity stays. Delete it from the device page (**Settings → Devices & Services → MQTT**).
 
 ## Upgrading from 1.0.x
 

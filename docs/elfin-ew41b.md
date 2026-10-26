@@ -58,21 +58,33 @@ The web UI is plain HTTP. It shows the MQTT password in clear text, and its conf
 
 Don't reuse your own MQTT login: the gateway stores it in plain text. With the Mosquitto add-on, add a login under the add-on's **Configuration → Logins** (for example `elfin`), restart the add-on, and enter the login in the gateway's MQTT socket.
 
-To limit that user to the two bus topics, set `customize: active: true` in the add-on configuration and add `/share/mosquitto/acl.conf`:
+To limit that user to the two bus topics, use an access control list (ACL). The add-on loads every `.conf` file in `/share/mosquitto` as broker configuration, so it takes two files: a `.conf` file that points to the ACL, and the ACL itself.
+
+The add-on doesn't create `/share/mosquitto`, so create it first. From the Terminal & SSH add-on it's `/share`. Over the Samba add-on it's the `share` network share. The File editor only shows your config folder unless you set `enforce_basepath: false`.
+
+`/share/mosquitto/acl.conf`:
 
 ```
-user elfin
-topic write uponor_read
-topic read uponor_write
+acl_file /share/mosquitto/accesscontrollist
+```
 
+`/share/mosquitto/accesscontrollist`:
+
+```
 user homeassistant
 topic readwrite #
 
 user addons
 topic readwrite #
+
+user elfin
+topic write uponor_read
+topic read uponor_write
 ```
 
-Once an ACL file is active, users it doesn't list get no access. Add your other MQTT clients (Zigbee2MQTT, ESPHome devices and so on) before enabling it.
+Then set `customize: active: true` (folder `mosquitto`) in the add-on configuration and restart it. Don't put the ACL rules in the `.conf` file itself, or the broker won't start.
+
+Once the ACL is active, logins it doesn't list can still connect but get no access to any topic, and the broker reports no error. Add a `topic readwrite #` entry for each of your other MQTT clients (Node-RED, Zigbee2MQTT, ESPHome devices and so on) before enabling it. Their logins show up in the add-on log as `New client connected ... u'<user>'`.
 
 ### Isolate it on the network
 
