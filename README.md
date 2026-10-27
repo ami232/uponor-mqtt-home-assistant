@@ -99,6 +99,31 @@ Each thermostat also gets these sensors, created once it reports the value:
 | Humidity | `sensor.uponor_<id>_current_humidity` |
 | Target temperature | `sensor.uponor_<id>_temperature` |
 
+## Virtual thermostat (experimental)
+
+The controller only opens a channel when the thermostat registered to it asks for heat. A virtual thermostat lets Home Assistant be that thermostat. It registers on the bus like a T-148 and reports the temperature of any Home Assistant sensor, for example a Zigbee thermometer in a room that has no Uponor thermostat. The controller then switches the channel's actuators itself, using that temperature and the setpoint you set in Home Assistant.
+
+It has been tested on a Smatrix Base Pulse X-245 with T-148 thermostats and an Elfin EW41B. **Heat only.** While the controller is in cooling mode, and whenever the sensor is unavailable, it reports a temperature that doesn't ask for heat.
+
+**Why it needs a TCP socket.** The controller expects an answer within a few tens of milliseconds of polling a thermostat. Through the EW41B's MQTT client the round trip measured 100–270 ms, which is too slow. Through its raw TCP socket it measured about 45 ms, which the controller accepts. The virtual thermostat therefore talks to the gateway over TCP; everything else stays on MQTT.
+
+### Setup
+
+1. On the gateway, add a **Tcp Server** socket on port 8899 with route **Uart**. The gateway guide has [the details and the security trade-off](docs/elfin-ew41b.md#raw-tcp-socket-for-the-virtual-thermostat).
+2. Under **Configure → Bus and gateway settings**, enter the gateway's IP address and TCP port.
+3. Under **Configure → Add a virtual thermostat**, choose:
+   - an **unused** 4-digit hex device ID (one is suggested, e.g. `42F0`)
+   - the room temperature sensor, and optionally a humidity sensor
+
+   Repeat for each room. All virtual thermostats share one connection to the gateway.
+4. Register it like a real thermostat. Run the action `uponor_mqtt.register_virtual_thermostat` with its `device_id`; `seconds` sets how long it waits, 60 by default. While it waits, go to the controller: hold **OK** until a channel LED flashes red, move to the channel with **< / >** and press **OK** (the LED flashes green). The channel LED turns steady green when registration succeeds. Hold **OK** to leave registration mode.
+
+The virtual thermostat then appears as `climate.uponor_<device id>`, like the real ones. Its setpoint is stored in Home Assistant and survives restarts.
+
+**If Home Assistant stops answering**, during a restart or with `uponor_mqtt.stop_virtual_thermostat`, the controller treats the thermostat as lost. As with a real thermostat, it doesn't close the channel; it runs its heating fallback until the virtual thermostat answers again. `uponor_mqtt.start_virtual_thermostat` resumes answering. To remove one, unregister its channel on the controller and use **Configure → Remove a virtual thermostat**.
+
+**Measuring latency.** `uponor_mqtt.measure_latency` times poll → reply round trips to a real thermostat through MQTT. It transmits on the bus, but only the controller's own poll and only while the bus is idle.
+
 ## Troubleshooting
 
 **No entities appear**
@@ -124,11 +149,20 @@ logger:
     custom_components.uponor_mqtt: debug
 ```
 
+**Raw bus capture**
+
+For protocol research, turn on **Capture raw bus traffic** under **Configure**. Every payload received from the gateway, and every frame the integration writes, is appended with a timestamp to `<config>/uponor_capture.jsonl`. The `uponor_mqtt.capture_note` action adds a marker line. Analyze the file with `tools/analyze_capture.py` (see [docs/bus-protocol-notes.md](docs/bus-protocol-notes.md)). Turn it off afterwards, because the file keeps growing.
+
 ## Limitations
 
 - One Uponor controller (one system ID) per Home Assistant instance.
 - Only target temperature can be set. Mode (heat/cool) and the ECO preset are read-only.
 - Temperatures are in °C.
+
+## Upgrading to 1.3.0
+
+- **Virtual thermostat (experimental).** Home Assistant can act as a thermostat for a channel that has none. See [Virtual thermostat](#virtual-thermostat-experimental). It's off unless you configure it, and it needs the gateway's TCP socket.
+- **New options and actions.** A raw bus capture option for troubleshooting, and the `capture_note` and `measure_latency` actions. Nothing changes for existing setups.
 
 ## Upgrading to 1.2.0
 

@@ -8,18 +8,28 @@ from typing import Any
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
+from homeassistant.helpers import selector
 
 from .const import (
+    CONF_CAPTURE,
+    CONF_DEVICE_ID,
     CONF_DISCOVERY_PREFIX,
+    CONF_HUMIDITY_ENTITY,
     CONF_READ_TOPIC,
     CONF_SYSTEM_ID,
+    CONF_TEMPERATURE_ENTITY,
+    CONF_VIRTUAL_HOST,
+    CONF_VIRTUAL_PORT,
+    CONF_VIRTUAL_THERMOSTATS,
     CONF_WRITE_TOPIC,
     DEFAULT_NAME,
     DEFAULT_READ_TOPIC,
+    DEFAULT_VIRTUAL_PORT,
     DEFAULT_WRITE_TOPIC,
     DOMAIN,
     HA_DISCOVERY_PREFIX,
 )
+from .virtual import parse_device_id
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +95,28 @@ def _validate_bus_input(
     return data
 
 
+def _gateway_tcp_schema(defaults: dict[str, Any]) -> dict:
+    """Gateway raw TCP socket, used by the virtual thermostats."""
+    return {
+        vol.Optional(
+            CONF_VIRTUAL_HOST,
+            description={"suggested_value": defaults.get(CONF_VIRTUAL_HOST)},
+        ): str,
+        vol.Optional(
+            CONF_VIRTUAL_PORT,
+            default=defaults.get(CONF_VIRTUAL_PORT, DEFAULT_VIRTUAL_PORT),
+        ): vol.All(vol.Coerce(int), vol.Range(min=1, max=65535)),
+    }
+
+
+def _next_device_id(used: set[str]) -> str:
+    """First free ID from 42F0 up, in the same range as the T-148s seen so far."""
+    dev = 0x42F0
+    while f"{dev:04X}" in used:
+        dev += 1
+    return f"{dev:04X}"
+
+
 class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for the Uponor MQTT Bridge."""
 
@@ -130,18 +162,111 @@ class UponorMQTTConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class UponorMQTTOptionsFlow(config_entries.OptionsFlow):
-    """Allow changing topics and system ID after setup."""
+    """Change the bus settings and manage virtual thermostats."""
+
+    @property
+    def _current(self) -> dict[str, Any]:
+        return {**self.config_entry.data, **self.config_entry.options}
+
+    def _virtuals(self) -> list[dict[str, Any]]:
+        return list(self._current.get(CONF_VIRTUAL_THERMOSTATS) or [])
+
+    def _save(self, **changes: Any):
+        options = {**self.config_entry.options, **changes}
+        return self.async_create_entry(data=options)
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
+        menu = ["settings", "add_virtual"]
+        if self._virtuals():
+            menu.append("remove_virtual")
+        return self.async_show_menu(step_id="init", menu_options=menu)
+
+    async def async_step_settings(self, user_input: dict[str, Any] | None = None):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = _validate_bus_input(user_input, errors)
+            data[CONF_CAPTURE] = user_input.get(CONF_CAPTURE, False)
+            data[CONF_VIRTUAL_HOST] = (user_input.get(CONF_VIRTUAL_HOST) or "").strip() or None
+            data[CONF_VIRTUAL_PORT] = user_input.get(CONF_VIRTUAL_PORT, DEFAULT_VIRTUAL_PORT)
             if not errors:
-                return self.async_create_entry(data=data)
+                return self._save(**data)
 
-        current = {**self.config_entry.data, **self.config_entry.options}
+        current = self._current
+        schema = {
+            **_bus_schema(current),
+            vol.Optional(CONF_CAPTURE, default=current.get(CONF_CAPTURE, False)): bool,
+            **_gateway_tcp_schema(current),
+        }
         return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(_bus_schema(current)),
-            errors=errors,
+            step_id="settings", data_schema=vol.Schema(schema), errors=errors
         )
+
+    async def async_step_add_virtual(self, user_input: dict[str, Any] | None = None):
+        errors: dict[str, str] = {}
+        virtuals = self._virtuals()
+        # Never reuse the address of a real thermostat or another virtual one
+        bridge = self.hass.data.get(DOMAIN, {}).get("bridge")
+        used = {v[CONF_DEVICE_ID] for v in virtuals}
+        if bridge is not None:
+            used |= set(bridge.discovered_devices)
+        if not self._current.get(CONF_VIRTUAL_HOST):
+            errors["base"] = "no_gateway_tcp"
+        elif user_input is not None:
+            try:
+                device_id = parse_device_id(user_input[CONF_DEVICE_ID])
+            except ValueError:
+                errors[CONF_DEVICE_ID] = "invalid_device_id"
+            else:
+                if device_id in used:
+                    errors[CONF_DEVICE_ID] = "device_id_in_use"
+            if not errors:
+                item = {
+                    CONF_DEVICE_ID: device_id,
+                    CONF_TEMPERATURE_ENTITY: user_input[CONF_TEMPERATURE_ENTITY],
+                    CONF_HUMIDITY_ENTITY: user_input.get(CONF_HUMIDITY_ENTITY),
+                }
+                return self._save(**{CONF_VIRTUAL_THERMOSTATS: [*virtuals, item]})
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_DEVICE_ID, default=_next_device_id(used)): str,
+                vol.Required(CONF_TEMPERATURE_ENTITY): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain="sensor", device_class="temperature"
+                    )
+                ),
+                vol.Optional(CONF_HUMIDITY_ENTITY): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor", device_class="humidity")
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="add_virtual", data_schema=schema, errors=errors
+        )
+
+    async def async_step_remove_virtual(self, user_input: dict[str, Any] | None = None):
+        virtuals = self._virtuals()
+        if user_input is not None:
+            remove = set(user_input[CONF_DEVICE_ID])
+            return self._save(
+                **{
+                    CONF_VIRTUAL_THERMOSTATS: [
+                        v for v in virtuals if v[CONF_DEVICE_ID] not in remove
+                    ]
+                }
+            )
+        options = [
+            selector.SelectOptionDict(
+                value=v[CONF_DEVICE_ID],
+                label=f"{v[CONF_DEVICE_ID]} ({v[CONF_TEMPERATURE_ENTITY]})",
+            )
+            for v in virtuals
+        ]
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_DEVICE_ID): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=options, multiple=True)
+                )
+            }
+        )
+        return self.async_show_form(step_id="remove_virtual", data_schema=schema)

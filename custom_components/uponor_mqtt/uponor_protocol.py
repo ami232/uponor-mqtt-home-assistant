@@ -235,6 +235,42 @@ class UponorThermostat:
         return state
 
 
+def build_poll_packet(sys_id: int, dev_id: str) -> bytes:
+    """Build the controller's poll (`FF`) for a device."""
+    body = struct.pack(">HHB", sys_id, int(dev_id, 16), UponorFields.REQUEST)
+    return body + struct.pack("<H", crc16_modbus(body))
+
+
+def build_fields_packet(sys_id: int, dev_id: str, fields: list[tuple[int, int]]) -> bytes:
+    """Build a frame carrying `(field, value)` pairs."""
+    body = struct.pack(">HH", sys_id, int(dev_id, 16))
+    for field, value in fields:
+        body += struct.pack(">BH", field, value)
+    return body + struct.pack("<H", crc16_modbus(body))
+
+
+# The controller broadcasts this every ~200 ms while a channel waits for a
+# thermostat to register
+REGISTRATION_BROADCAST = bytes.fromhex("19000000fab981")
+# A T-148 reports this mode2 value, both in its replies and when registering
+THERMOSTAT_MODE2 = 0x0C03
+# High byte a T-148 sends with its humidity reading
+HUMIDITY_FLAGS = 0x9600
+
+
+def build_registration_packets(sys_id: int, dev_id: str) -> list[bytes]:
+    """Frames a T-148 sends after a registration broadcast (seen on an X-245)."""
+    dev = int(dev_id, 16)
+    return [
+        body + struct.pack("<H", crc16_modbus(body))
+        for body in (
+            struct.pack(">HHBBH", sys_id, dev, 0xFA, UponorFields.MODE2, THERMOSTAT_MODE2),
+            struct.pack(">HHB", sys_id, dev, 0xFB),
+            struct.pack(">HHB", sys_id, dev, 0xFC),
+        )
+    ]
+
+
 def build_command_packet(
     sys_id: int, dev_id: str, temp: float, unit: str = "C"
 ) -> bytes:

@@ -50,7 +50,7 @@ The web UI is plain HTTP. It shows the MQTT password in clear text, and its conf
 
 ### Close what you don't use
 
-- **The `netp` socket.** Delete it under **Communication Settings** if you only use MQTT. It's a TCP server on port 8899 that gives unauthenticated raw access to the bus.
+- **The `netp` socket.** Delete it under **Communication Settings** unless you use the [virtual thermostat](#raw-tcp-socket-for-the-virtual-thermostat). It's a TCP server on port 8899 that gives unauthenticated raw access to the bus.
 - **The built-in access point.** Once the gateway is on your network, set **WiFi mode** to **STA** so the access point is off. If you keep it as a fallback, give it a WPA2 password.
 - **Telnet.** Keep it disabled under **System Settings**.
 
@@ -98,3 +98,20 @@ nmap -p 1-1024,8899 <gateway IP>
 ```
 
 Only port 80 (the web UI) should be open.
+
+## Raw TCP socket for the virtual thermostat
+
+The [virtual thermostat](../README.md#virtual-thermostat-experimental) has to answer the controller faster than the gateway's MQTT client can. Under **Communication Settings → +Add**, add:
+
+| Setting | Value |
+| --- | --- |
+| Name | e.g. `netp` |
+| Protocol | Tcp Server |
+| Local port | 8899 |
+| Buffer size / Keep alive / Timeout | 512 / 60 / 0 |
+| Max accept | 1 |
+| Security / Route | Disable / Uart |
+
+Leave the serial gap time at 10 ms. It works, and it keeps MQTT messages aligned with bus frames.
+
+This socket has no authentication. Anyone who can reach it can read the bus and send raw bytes to it. **Max accept 1 doesn't make it exclusive:** in testing, the gateway still accepted a second client while Home Assistant was connected. Keep the gateway on a network segment that only Home Assistant can reach, or firewall port 8899 to the Home Assistant host.
