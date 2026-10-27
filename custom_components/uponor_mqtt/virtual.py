@@ -51,6 +51,9 @@ SETPOINT_ANNOUNCEMENTS = 3
 NO_DEMAND_MARGIN_RAW = 36
 COOLING_BIT = 0x1000
 RECONNECT_DELAY = 5
+# The controller polls every second or so, so a silent socket is a dead one
+# (e.g. the gateway dropped off Wi-Fi without closing the connection)
+READ_TIMEOUT = 30
 REGISTRATION_WINDOW = 60
 STORAGE_VERSION = 1
 SAVE_DELAY = 5
@@ -115,10 +118,19 @@ class GatewayConnection:
                 self._writer = writer
                 warned = False
                 _LOGGER.info("Connected to gateway TCP %s:%s", self._host, self._port)
-                while data := await reader.read(512):
+                while data := await asyncio.wait_for(reader.read(512), READ_TIMEOUT):
                     for virtual in self.virtuals:
                         virtual.on_bus_data(data)
                 raise ConnectionError("gateway closed the connection")
+            except TimeoutError:
+                _LOGGER.warning(
+                    "No bus data from gateway TCP %s:%s for %d s; reconnecting",
+                    self._host,
+                    self._port,
+                    READ_TIMEOUT,
+                )
+                self._close()
+                await asyncio.sleep(RECONNECT_DELAY)
             except (OSError, ConnectionError) as exc:
                 if not warned:
                     _LOGGER.warning(
