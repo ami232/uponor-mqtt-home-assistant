@@ -656,10 +656,9 @@ class HAUponorBridge:
             "temperature_state_topic": f"{base_topic}/temperature",
             "action_topic": f"{base_topic}/action",
             "mode_state_topic": f"{base_topic}/mode",
+            "mode_command_topic": f"{base_topic}/mode/set",
             "temperature_command_topic": f"{base_topic}/temperature/set",
-            # Heating/cooling is switched at the controller, so only the current
-            # mode is offered; the config is republished when it changes
-            "modes": [thermostat.state().get("mode", "heat")],
+            "modes": ["heat", "cool"],
             "preset_modes": ["eco"],
             "preset_mode_state_topic": f"{base_topic}/preset_mode",
             "preset_mode_command_topic": f"{base_topic}/preset_mode/set",
