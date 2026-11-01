@@ -57,6 +57,13 @@ CAPTURE_FLUSH_INTERVAL = timedelta(seconds=5)
 PROBE_QUIET = 3.0
 PROBE_TIMEOUT = 2.0
 
+# Setpoint writes sent back to back collide on the bus and get lost, so they
+# go out one at a time and are resent until the thermostat reports the new
+# value (it is polled every ~10 s)
+SETPOINT_GAP = 1.0
+SETPOINT_CONFIRM_TIMEOUT = 25.0
+SETPOINT_ATTEMPTS = 3
+
 
 def _append_lines(path: str, lines: list[str]) -> None:
     with open(path, "a", encoding="utf-8") as f:
@@ -109,6 +116,10 @@ class HAUponorBridge:
         self._last_registration_broadcast = 0.0
         self._probe: tuple[str, asyncio.Future[float]] | None = None
         self.virtuals: dict[str, VirtualThermostat] = {}
+        # Pending setpoint writes to real thermostats
+        self._setpoint_targets: dict[str, float] = {}
+        self._setpoint_tasks: dict[str, asyncio.Task] = {}
+        self._setpoint_lock = asyncio.Lock()
 
     @property
     def system_id(self) -> int | None:
@@ -226,6 +237,9 @@ class HAUponorBridge:
             except Exception:
                 _LOGGER.debug("Time sync task ended with an error", exc_info=True)
             self._time_task = None
+        for task in self._setpoint_tasks.values():
+            task.cancel()
+        self._setpoint_tasks.clear()
         if self._capture_unsub is not None:
             self._capture_unsub()
             self._capture_unsub = None
@@ -540,12 +554,57 @@ class HAUponorBridge:
             self._published.setdefault(device_id, {})["temperature"] = temperature
             _LOGGER.info("[%s] Virtual thermostat setpoint %.1f°C", device_id, temperature)
             return
+        if self._system_id is None and device_id not in self.device_state_cache:
+            _LOGGER.error(
+                "[%s] Cannot set temperature: Uponor system ID not known yet. "
+                "Wait for bus traffic or set the System ID in the integration options",
+                device_id,
+            )
+            return
+
+        # Delivered in the background; a newer value replaces one still queued
+        self._setpoint_targets[device_id] = temperature
+        await self._publish(f"{self._base_topic(device_id)}/temperature", str(temperature))
+        self._published.setdefault(device_id, {})["temperature"] = temperature
+        task = self._setpoint_tasks.get(device_id)
+        if task is None or task.done():
+            self._setpoint_tasks[device_id] = self.hass.async_create_background_task(
+                self._async_deliver_setpoint(device_id),
+                f"{DOMAIN} setpoint {device_id}",
+            )
+
+    async def _async_deliver_setpoint(self, device_id: str) -> None:
+        """Write the queued setpoint until the thermostat reports it."""
+        for _attempt in range(SETPOINT_ATTEMPTS):
+            async with self._setpoint_lock:
+                temperature = self._setpoint_targets[device_id]
+                await self._write_setpoint(device_id, temperature)
+                await asyncio.sleep(SETPOINT_GAP)
+            deadline = time.monotonic() + SETPOINT_CONFIRM_TIMEOUT
+            while time.monotonic() < deadline:
+                if self._setpoint_targets[device_id] != temperature:
+                    break  # a newer value arrived; send that instead
+                reported = self.device_state_cache.get(device_id, {}).get("temperature")
+                if reported is not None and abs(float(reported) - temperature) < 0.05:
+                    del self._setpoint_targets[device_id]
+                    return
+                await asyncio.sleep(0.5)
+            else:
+                _LOGGER.info("[%s] Setpoint %.1f°C not confirmed, resending", device_id, temperature)
+        _LOGGER.warning(
+            "[%s] Thermostat did not confirm setpoint %.1f°C after %d attempts",
+            device_id,
+            self._setpoint_targets.pop(device_id),
+            SETPOINT_ATTEMPTS,
+        )
+
+    async def _write_setpoint(self, device_id: str, temperature: float) -> None:
         device_state = self.device_state_cache.get(device_id)
         thermostat = self._thermostats.get(device_id)
         if device_state and thermostat:
             sys_id = device_state["sys_id"]
             raw = thermostat.setpoint_raw(temperature)
-        elif self._system_id is not None:
+        else:
             _LOGGER.warning(
                 "[%s] Device not in cache, using system ID 0x%04X",
                 device_id,
@@ -553,13 +612,6 @@ class HAUponorBridge:
             )
             sys_id = self._system_id
             raw = temp_to_uponor(temperature)
-        else:
-            _LOGGER.error(
-                "[%s] Cannot set temperature: Uponor system ID not known yet. "
-                "Wait for bus traffic or set the System ID in the integration options",
-                device_id,
-            )
-            return
 
         try:
             buffer = build_setpoint_packet(sys_id, device_id.lower(), raw)
@@ -571,10 +623,6 @@ class HAUponorBridge:
                 raw,
                 sys_id,
             )
-            await self._publish(
-                f"{self._base_topic(device_id)}/temperature", str(temperature)
-            )
-            self._published.setdefault(device_id, {})["temperature"] = temperature
         except Exception as exc:
             _LOGGER.exception("Failed to build/send command for %s: %s", device_id, exc)
 
